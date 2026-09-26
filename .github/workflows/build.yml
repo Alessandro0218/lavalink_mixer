@@ -34,5 +34,9 @@ jobs:
       - name: Upload mixer jar
         uses: actions/upload-artifact@v4
         with:
-          name: mixer.jar
+          # NOTE: GitHub always serves artifacts as a .zip archive
+          # (this downloads as mixer.zip containing the jar).
+          # For a direct .jar download, publish a Release instead —
+          # release.yml attaches the jar as a raw release asset.
+          name: mixer
           path: build/libs/*.jar

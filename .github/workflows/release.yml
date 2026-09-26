@@ -17,7 +17,7 @@ jobs:
       - name: Download mixer jar
         uses: actions/download-artifact@v4
         with:
-          name: mixer.jar
+          name: mixer
 
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
