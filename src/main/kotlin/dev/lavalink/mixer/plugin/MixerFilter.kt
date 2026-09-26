@@ -47,7 +47,8 @@ class MixerFilter(private val mixer: GuildMixer) : FloatPcmAudioFilter {
         }
 
         val sub = Array(input.size) { FloatArray(length) }
-        mixer.takeSub(length, input.size, sub)
+        val subSamples = mixer.takeSub(length, input.size, sub)
+        mixer.noteSubOutput(subSamples)
 
         for (c in input.indices) {
             val channel = input[c]

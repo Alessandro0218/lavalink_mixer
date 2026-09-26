@@ -74,7 +74,7 @@ components:
         guildId:
           type: string
           description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        hasNext: { type: boolean, description: A preloaded next track is waiting }
+        hasNext: { type: boolean, description: A preloaded next track is waiting (pending or ready — true from queue time) }
         overlayActive: { type: boolean }
         crossfadeActive: { type: boolean, description: An overlap mix is in progress }
         crossfadeEnabled: { type: boolean }
@@ -89,7 +89,7 @@ components:
           prefixItems:
             - { type: integer, description: Leading silence in ms, skipped via seek }
             - { type: integer, description: Trailing silence in ms, ends the track early }
-          description: Present only when the queued track finished silence analysis
+          description: Present only when the queued track finished silence analysis (ready). Null while still analyzing (pending) — hasNext is already true then.
     CrossfadeRequest:
       type: object
       required: [guildId, enabled]
@@ -177,9 +177,12 @@ paths:
       operationId: queueNext
       summary: Preload the next track (the gapless primitive)
       description: |
-        Loads `identifier` now and stores it in the guild's "next" slot.
-        When the current track ends (or its trailing silence begins), the
-        server starts this track immediately with no client round-trip.
+        Loads `identifier` now and stores it in the guild's "next" slot
+        (pending → ready once async silence analysis finishes).
+        At content end (`duration - trailingSilence`) the server starts this
+        track immediately with no client round-trip — detected trailing
+        silence is never played. If analysis is still running then, the
+        server advances anyway without trim rather than stalling.
         Replaces any previously queued track. For gapless playback, call this
         while the current track is still playing — ideally right after it starts.
       requestBody:
@@ -244,8 +247,11 @@ paths:
       summary: Configure overlap crossfade
       description: |
         When a next track is queued and the current one is finite + seekable,
-        the next track starts on a hidden player `durationMs` before the end
-        (trailing silence excluded) and the two mix with an equal-power curve.
+        the next track starts on a hidden player `durationMs` before content
+        end (`duration - trailingSilence`, audible content only) and the two
+        mix with an equal-power curve; the handoff lands exactly at content
+        end. Overlap start waits for silence analysis to release the sub
+        player, so a slow analysis degrades that transition to a cut.
         Requires the mixer filter enabled (step 1 of the workflow).
       requestBody:
         required: true
@@ -330,10 +336,12 @@ paths:
       operationId: setSilenceSkipping
       summary: Configure leading/trailing silence skipping
       description: |
-        Leading silence is skipped via seek when a queued track starts;
+        Leading silence is skipped via seek when a queued track starts (the
+        client-played first track only trims if already cached);
         trailing silence ends the track early (drives gapless advance and the
-        crossfade trigger). Analysis runs async at queue time; `nextTrimMs` in
-        state shows results. Streams only get leading analysis.
+        crossfade trigger). Analysis runs async at queue time (pending →
+        ready); `nextTrimMs` in state shows results once ready. Streams only
+        get leading analysis plus the realtime tail cut.
       requestBody:
         required: true
         content:

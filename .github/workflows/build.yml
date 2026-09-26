@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**.md'
+      - 'display.html'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'display.html'
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build plugin
+        run: chmod +x gradlew && ./gradlew build
+
+      - name: Upload mixer jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixer.jar
+          path: build/libs/*.jar

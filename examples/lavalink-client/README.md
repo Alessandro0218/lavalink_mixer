@@ -19,15 +19,43 @@ skipping + TTS overlay. Tested against lavalink-client v2.9+ API
 
 ```
 trackStart(A) → enable mixer filter (once) → POST /mixer/queue/next (B)
-A ends       → server starts B instantly (lead-trimmed, crossfaded)
+A content ends → server starts B instantly (lead-trimmed, crossfaded)
 trackStart(B) → client queue synced (no play sent!) → POST /mixer/queue/next (C)
 ```
+
+"Content ends" means `duration - trailingSilence`, not file end: detected
+trailing silence is never played or crossfaded. With crossfade enabled the
+overlap covers audible content only, and the handoff lands exactly at
+content end. Without crossfade (or for streams) the server cuts to B at the
+last audible sample.
 
 - `trackEnd` → do nothing if we preloaded (server took over); a watchdog
   resumes via `player.skip()` if no `trackStart` follows in ~5s.
 - `trackError`/`trackStuck` → same treatment (server advances on
   `LOAD_FAILED` too).
 - queue empty at `trackEnd` → normal `queueEnd` flow, untouched.
+
+## Trim timing: pending → ready
+
+`POST /mixer/queue/next` returns as soon as the track loads; silence
+analysis finishes async. Poll `GET /mixer/state`:
+
+- `hasNext: true`, `nextTrimMs: null` → queued but still analyzing
+  ("pending"). The server still advances gaplessly, but without trim.
+- `nextTrimMs: [leadMs, trailMs]` → analysis done ("ready"). The upcoming
+  transition uses both ends.
+
+Queue early (right after `trackStart`, which is what `mixerPlugin.ts` does)
+so analysis usually finishes before the transition. If analysis is still
+running at content end, the server advances anyway (degraded, no trim)
+rather than playing silence. Crossfade overlap itself waits for analysis to
+release the sub player; a slow analysis degrades that one transition to a
+cut.
+
+First-track caveat: the track you start with plain `player.play()` never
+went through the preload slot, so its own leading silence is only skipped
+if its trim was already cached from an earlier preload. Every
+server-advanced track after that gets lead-trimmed automatically.
 
 ## User skip — use the handle, not `player.skip()`
 
@@ -58,9 +86,12 @@ await mixer.announce(player, { identifier: "https://tts.example.com/abc.mp3" });
 await mixer.announce(player, { encodedTrack: track.encoded });
 ```
 
-409 = secondary player busy (crossfade overlap / analysis running) → retry
-later or `mixer.cancelAnnounce(player)` + retry. `mixer.cancelAnnounce`
-also stops a running overlay and restores music.
+ 409 = secondary player busy (crossfade overlap / overlay / silence
+analysis running) → retry later or `mixer.cancelAnnounce(player)` + retry.
+Avoid announcing in the second right after preloading while analysis is
+still running; `nextTrimMs` appearing in `mixer.state()` means the sub
+player is free again. `mixer.cancelAnnounce` also stops a running overlay
+and restores music.
 
 ## Filters interplay
 
@@ -79,4 +110,6 @@ console.log(await mixer.state(player));
 // { hasNext, nextTrimMs: [leadMs, trailMs] | null, overlayActive, crossfadeActive, ... }
 ```
 
-`nextTrimMs` appears once silence analysis of the queued track finishes.
+`nextTrimMs` appears once silence analysis of the queued track finishes
+(see "Trim timing" above). `hasNext` is true from queue time, even while
+`nextTrimMs` is still null.

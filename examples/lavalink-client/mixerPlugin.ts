@@ -3,11 +3,16 @@
  *
  * What this wires up:
  *  - Gapless + crossfade: keeps ONE track preloaded server-side ("1-ahead").
- *    The server starts it the instant the current track ends — the client
- *    must NOT send `play` on trackEnd (see `autoSkip: false` below).
- *  - Leading/trailing silence skipping via the plugin (pre-analysis +
- *    realtime tail cut). Nothing extra needed client-side beyond preloading.
- *  - TTS/announcement overlay without touching the music queue.
+ *    The server starts it at content end (`duration - trailingSilence`) —
+ *    the client must NOT send `play` on trackEnd (see `autoSkip: false`
+ *    below). Trailing silence is never played or crossfaded; the overlap
+ *    covers audible content only.
+ *  - Leading/trailing silence skipping via the plugin (async pre-analysis
+ *    pending → ready + realtime tail cut). Nothing extra needed client-side
+ *    beyond preloading early (right after trackStart). If analysis is still
+ *    running at content end the server advances without trim.
+ *  - TTS/announcement overlay without touching the music queue (409 while
+ *    crossfading, overlaying, or analyzing — retry once ready).
  *
  * REQUIRED manager setup (do this where you create the LavalinkManager):
  *
