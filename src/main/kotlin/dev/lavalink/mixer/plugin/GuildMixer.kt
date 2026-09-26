@@ -11,6 +11,7 @@ import dev.arbjerg.lavalink.api.IPlayer
 import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -69,15 +70,16 @@ class GuildMixer(
 
     private var subPlayer: AudioPlayer? = null
     private var siphonFactory: SiphonFactory? = null
-    private var analysisActive: Boolean = false
+    @Volatile private var analysisActive: Boolean = false
     private val trimCache = LinkedHashMap<String, TrimPoints>()
     private var subTrack: AudioTrack? = null
     private var subStartMs: Long = 0L
-    private var overlayActive: Boolean = false
-    private var xfadeActive: Boolean = false
+    /** Voice thread reads these without taking [lock]; races only shift a fade by a chunk. */
+    @Volatile private var overlayActive: Boolean = false
+    @Volatile private var xfadeActive: Boolean = false
     private var xfadeHandoffMs: Long = -1L
     /** Position within [subTrack] that has reached the audible output. */
-    private var subOutputSamples: Long = 0L
+    private val subOutputSamples = AtomicLong(0L)
     private var subStartPositionMs: Long = 0L
     private var announceToken: Long = 0L
     private var masking: Boolean = false
@@ -87,77 +89,133 @@ class GuildMixer(
 
     private val mainGain = GainRamp(1f)
     private val subGain = GainRamp(0f)
-    private var xfadeLeft: Int = 0
-    private var xfadeTotal: Int = 1
+    /** Written by the voice thread every chunk; control plane only (re)starts the fade. */
+    @Volatile private var xfadeLeft: Int = 0
+    @Volatile private var xfadeTotal: Int = 1
+    /** Set when the sub decoder reports stuck/exception mid-analysis so scans abort early. */
+    @Volatile private var analysisBroken: Boolean = false
 
     val siphon = SiphonQueue()
     private val drainFrame = MutableAudioFrame().apply {
         setBuffer(ByteBuffer.allocate(StandardAudioDataFormats.DISCORD_OPUS.maximumChunkSize()))
     }
 
+    private data class StartSnap(val xfade: Boolean, val leadMs: Long, val fadeInMs: Long)
+
     val mainListener = object : AudioEventAdapter() {
         override fun onTrackStart(player: AudioPlayer, track: AudioTrack) {
-            synchronized(lock) {
+            // Snapshot under lock; the (potentially blocking) seek runs outside it
+            // so the voice thread never stalls behind us.
+            val snap = synchronized(lock) {
                 tailCutter.reset()
                 if (masking) {
                     masking = false
-                    return
-                }
-                // Leading-silence skip: start at content, not file start.
-                // Queued tracks already seek in applyLeadLocked; this covers
-                // the first track (played via Lavalink REST) when its trim
-                // was cached by an earlier preload/analysis.
-                if (!xfadeActive && silenceSkipEnabled) {
-                    val lead = leadForLocked(track)
-                    if (lead > 200 && track.isSeekable) {
-                        try {
-                            val duration = track.duration
-                            track.position = if (duration > 0) {
-                                lead.coerceIn(0, (duration - 500).coerceAtLeast(0))
-                            } else lead
-                        } catch (e: Exception) {
-                            log.warn("lead skip seek failed on guild {}", guildId, e)
-                        }
-                    }
-                }
-                if (!xfadeActive && fadeInMs > 0) {
-                    mainGain.setNow(0f)
-                    mainGain.rampTo(1f, msToSamples(fadeInMs))
-                }
-            }
-        }
-
-        override fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
-            synchronized(lock) {
-                if (endReason != AudioTrackEndReason.FINISHED && endReason != AudioTrackEndReason.LOAD_FAILED) return
-                if (xfadeActive) {
-                    doHandoffLocked()
+                    null
                 } else {
-                    advanceNextLocked()
+                    StartSnap(
+                        xfadeActive,
+                        if (!xfadeActive && silenceSkipEnabled) leadForLocked(track) else -1L,
+                        fadeInMs,
+                    )
+                }
+            } ?: return
+            // Leading-silence skip: start at content, not file start.
+            // Queued tracks already seek in seekPastLead; this covers
+            // the first track (played via Lavalink REST) when its trim
+            // was cached by an earlier preload/analysis.
+            if (!snap.xfade && snap.leadMs > 200 && track.isSeekable) {
+                try {
+                    val duration = track.duration
+                    track.position = if (duration > 0) {
+                        snap.leadMs.coerceIn(0, (duration - 500).coerceAtLeast(0))
+                    } else snap.leadMs
+                } catch (e: Exception) {
+                    log.warn("lead skip seek failed on guild {}", guildId, e)
                 }
             }
-        }
-    }
-
-    private val subListener = object : AudioEventAdapter() {
-        override fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
-            synchronized(lock) {
-                if (overlayActive) finishOverlayLocked()
-                else if (xfadeActive) abortXfadeLocked("sub track ended: $endReason")
+            if (!snap.xfade && snap.fadeInMs > 0) {
+                mainGain.setNow(0f)
+                mainGain.rampTo(1f, msToSamples(snap.fadeInMs))
             }
         }
 
-        override fun onTrackException(player: AudioPlayer, track: AudioTrack, exception: com.sedmelluq.discord.lavaplayer.tools.FriendlyException) {
-            synchronized(lock) {
-                if (overlayActive) finishOverlayLocked()
-                else if (xfadeActive) abortXfadeLocked("sub track exception")
+        override fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
+            if (endReason != AudioTrackEndReason.FINISHED && endReason != AudioTrackEndReason.LOAD_FAILED) return
+            // Decide under lock, act outside it (play/seek may block on source I/O).
+            val handoff = synchronized(lock) { xfadeActive }
+            if (handoff) {
+                doHandoff()
+            } else {
+                val hasNext = synchronized(lock) { readyNextTrack != null || pendingNextTrack != null }
+                if (hasNext) advanceNext()
             }
         }
 
         override fun onTrackStuck(player: AudioPlayer, track: AudioTrack, thresholdMs: Long) {
-            synchronized(lock) {
-                if (overlayActive) finishOverlayLocked()
-                else if (xfadeActive) abortXfadeLocked("sub track stuck")
+            val title = runCatching { track.info.title }.getOrDefault("unknown")
+            log.warn("main track '{}' stuck on guild {} (threshold {}ms); mixer failover", title, guildId, thresholdMs)
+            recoverFromMainStall()
+        }
+
+        override fun onTrackException(player: AudioPlayer, track: AudioTrack, exception: com.sedmelluq.discord.lavaplayer.tools.FriendlyException) {
+            val title = runCatching { track.info.title }.getOrDefault("unknown")
+            log.warn("main track '{}' failed on guild {}; mixer failover", title, guildId, exception)
+            recoverFromMainStall()
+        }
+    }
+
+    /**
+     * A stalled main track never reaches FINISHED, so without this the mixer
+     * would hang: during a crossfade the handoff position never arrives (the
+     * position is frozen), and otherwise the queued track never starts.
+     * Failing over keeps audio flowing; the TrackStuck/Exception event itself
+     * is still delivered to the client by the server's own listener.
+     */
+    private fun recoverFromMainStall() {
+        val handoff = synchronized(lock) { xfadeActive }
+        if (handoff) {
+            doHandoff()
+            return
+        }
+        val hasNext = synchronized(lock) { readyNextTrack != null || pendingNextTrack != null }
+        if (hasNext) advanceNext()
+    }
+
+    private val subListener = object : AudioEventAdapter() {
+        override fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
+            val overlay = synchronized(lock) { overlayActive }
+            if (overlay) {
+                finishOverlay()
+                return
+            }
+            val xfade = synchronized(lock) { xfadeActive }
+            if (xfade) abortXfade("sub track ended: $endReason")
+        }
+
+        override fun onTrackException(player: AudioPlayer, track: AudioTrack, exception: com.sedmelluq.discord.lavaplayer.tools.FriendlyException) {
+            subFailed()
+        }
+
+        override fun onTrackStuck(player: AudioPlayer, track: AudioTrack, thresholdMs: Long) {
+            subFailed()
+        }
+
+        private fun subFailed() {
+            val action = synchronized(lock) {
+                when {
+                    overlayActive -> 1
+                    xfadeActive -> 2
+                    analysisActive -> {
+                        // Unblock analyzeBlocking scans waiting on tap data that will never arrive.
+                        analysisBroken = true
+                        0
+                    }
+                    else -> 0
+                }
+            }
+            when (action) {
+                1 -> finishOverlay()
+                2 -> abortXfade("sub track stuck/failed")
             }
         }
     }
@@ -177,31 +235,31 @@ class GuildMixer(
 
     /** Advances ramps by [samples] and returns the gains to mix with. */
     fun advance(samples: Int): Gains {
-        synchronized(lock) {
-            if (xfadeActive) {
-                xfadeLeft -= samples
-                val t = (1f - xfadeLeft.toFloat() / xfadeTotal).coerceIn(0f, 1f)
-                // Equal-power curve keeps perceived loudness flat through the overlap.
-                val main = cos(t * PI.toFloat() / 2f)
-                val sub = sin(t * PI.toFloat() / 2f)
-                mainGain.setNow(main)
-                subGain.setNow(sub)
-            } else {
-                mainGain.advance(samples)
-                subGain.advance(samples)
-            }
-            return Gains(mainGain.current, subGain.current)
+        // Lock-free on purpose: this runs on the voice thread for every ~20ms
+        // chunk, and blocking here stalls main-track output until Lavaplayer
+        // reports the (healthy) track as stuck. GainRamp fields are volatile;
+        // a race with the control plane only shifts a fade by one chunk.
+        if (xfadeActive) {
+            val total = xfadeTotal.coerceAtLeast(1)
+            val left = (xfadeLeft - samples).coerceAtLeast(0)
+            xfadeLeft = left
+            val t = (1f - left.toFloat() / total).coerceIn(0f, 1f)
+            // Equal-power curve keeps perceived loudness flat through the overlap.
+            mainGain.setNow(cos(t * PI.toFloat() / 2f))
+            subGain.setNow(sin(t * PI.toFloat() / 2f))
+        } else {
+            mainGain.advance(samples)
+            subGain.advance(samples)
         }
+        return Gains(mainGain.current, subGain.current)
     }
 
     fun takeSub(samples: Int, channels: Int, out: Array<FloatArray>) = siphon.take(samples, channels, out)
 
     /** Counts only PCM that is actually mixed into the Discord output. */
     fun noteSubOutput(samples: Int) {
-        if (samples <= 0) return
-        synchronized(lock) {
-            if (xfadeActive) subOutputSamples += samples
-        }
+        if (samples <= 0 || !xfadeActive) return
+        subOutputSamples.addAndGet(samples.toLong())
     }
 
     /**
@@ -219,6 +277,20 @@ class GuildMixer(
         subGain.setNow(sub)
     }
 
+    /** Test seam: arm a fake overlap so [advance]/[noteSubOutput] can be driven without players. */
+    internal fun beginXfadeForTest(totalSamples: Int) {
+        xfadeTotal = totalSamples.coerceAtLeast(1)
+        xfadeLeft = xfadeTotal
+        subOutputSamples.set(0L)
+        xfadeActive = true
+    }
+
+    internal fun endXfadeForTest() {
+        xfadeActive = false
+    }
+
+    internal fun subOutputSamplesForTest(): Long = subOutputSamples.get()
+
     // ---- scheduler entry points ----
 
     /** Keeps the secondary decoder flowing; its PCM is captured by the siphon filter. */
@@ -231,73 +303,96 @@ class GuildMixer(
         }
     }
 
+    private sealed interface PollAction {
+        data object None : PollAction
+        data class StartOverlap(val plan: CrossfadePlan) : PollAction
+        data object Handoff : PollAction
+        data object AdvanceNext : PollAction
+        data class AbortXfade(val reason: String) : PollAction
+    }
+
     /**
      * Starts/finalizes a transition against the final *audible* sample.
      * A detected trailing silent segment is never played or included in a
      * crossfade: the overlap ends at `duration - trailingSilence`.
+     *
+     * Only cheap state reads happen under [lock]; player/track calls
+     * (play, seek, stop) run outside it so a slow source can never stall
+     * the voice thread into a false TrackStuck.
      */
     fun poll() {
-        synchronized(lock) {
-            val audioPlayer = main?.audioPlayer ?: return
-            val track = audioPlayer.playingTrack ?: run {
-                lastMainTrack = null
-                return
-            }
-            if (track !== lastMainTrack) {
-                lastMainTrack = track
-                lastPosition = safePosition(track)
-                return
-            }
-            val pos = safePosition(track)
-            if (pos < lastPosition - 1500) {
-                // User seeked backwards: any armed overlap is stale.
-                if (xfadeActive) abortXfadeLocked("seek during crossfade")
-                tailCutter.reset()
-            }
-            lastPosition = pos
-            // Opportunistic promotion: analysis may have finished since queue.
-            promoteIfPendingLocked()
-            if (!xfadeActive && (readyNextTrack != null || pendingNextTrack != null)) {
-                tailWatch = silenceSkipEnabled
-                val duration = track.duration
-                if (duration > 0 && duration < Long.MAX_VALUE / 2) {
-                    val trail = if (silenceSkipEnabled) trailForLocked(track) else 0L
-                    val contentEnd = TrimTransition.contentEnd(duration, trail)
-                    val plan = if (track.isSeekable && crossfadeEnabled) {
-                        TrimTransition.crossfade(contentEnd, crossfadeMs)
-                    } else null
-                    if (readyNextTrack != null && plan != null && pos >= plan.startMs && !analysisActive) {
-                        startOverlapLocked(plan)
-                    } else if (silenceSkipEnabled && trail > 0 && pos >= contentEnd) {
-                        // End exactly at the last audible sample; do not emit the file's tail silence.
-                        // Force-promote pending so a slow analysis never plays silence.
-                        if (readyNextTrack == null) promoteForcedLocked()
-                        advanceNextLocked()
-                    } else if (silenceSkipEnabled &&
-                        tailCutter.shouldCut(pos, duration, tailConfirmMs, silenceTailScanMs)
-                    ) {
-                        // Realtime fallback: sustained silence inside the tail window.
-                        if (readyNextTrack == null) promoteForcedLocked()
-                        advanceNextLocked()
-                    } else if (readyNextTrack == null && pendingNextTrack != null && pos >= duration - 500) {
-                        // Analysis still running at file end: advance anyway (degraded, no trim).
-                        promoteForcedLocked()
-                        advanceNextLocked()
-                    }
-                } else if (silenceSkipEnabled &&
-                    tailCutter.shouldCut(pos, -1, tailConfirmMs, silenceTailScanMs)
-                ) {
-                    // Streams have no pre-analysis tail; realtime is the only signal.
+        val action = synchronized(lock) { decidePollLocked() }
+        when (action) {
+            is PollAction.None -> Unit
+            is PollAction.StartOverlap -> startOverlap(action.plan)
+            is PollAction.Handoff -> doHandoff()
+            is PollAction.AdvanceNext -> advanceNext()
+            is PollAction.AbortXfade -> abortXfade(action.reason)
+        }
+    }
+
+    private fun decidePollLocked(): PollAction {
+        val audioPlayer = main?.audioPlayer ?: return PollAction.None
+        val track = audioPlayer.playingTrack ?: run {
+            lastMainTrack = null
+            return PollAction.None
+        }
+        if (track !== lastMainTrack) {
+            lastMainTrack = track
+            lastPosition = safePosition(track)
+            return PollAction.None
+        }
+        val pos = safePosition(track)
+        if (pos < lastPosition - 1500) {
+            // User seeked backwards: any armed overlap is stale.
+            tailCutter.reset()
+            if (xfadeActive) return PollAction.AbortXfade("seek during crossfade")
+        }
+        lastPosition = pos
+        // Opportunistic promotion: analysis may have finished since queue.
+        promoteIfPendingLocked()
+        if (!xfadeActive && (readyNextTrack != null || pendingNextTrack != null)) {
+            tailWatch = silenceSkipEnabled
+            val duration = track.duration
+            if (duration > 0 && duration < Long.MAX_VALUE / 2) {
+                val trail = if (silenceSkipEnabled) trailForLocked(track) else 0L
+                val contentEnd = TrimTransition.contentEnd(duration, trail)
+                val plan = if (track.isSeekable && crossfadeEnabled) {
+                    TrimTransition.crossfade(contentEnd, crossfadeMs)
+                } else null
+                if (readyNextTrack != null && plan != null && pos >= plan.startMs && !analysisActive) {
+                    return PollAction.StartOverlap(plan)
+                } else if (silenceSkipEnabled && trail > 0 && pos >= contentEnd) {
+                    // End exactly at the last audible sample; do not emit the file's tail silence.
+                    // Force-promote pending so a slow analysis never plays silence.
                     if (readyNextTrack == null) promoteForcedLocked()
-                    advanceNextLocked()
+                    return PollAction.AdvanceNext
+                } else if (silenceSkipEnabled &&
+                    tailCutter.shouldCut(pos, duration, tailConfirmMs, silenceTailScanMs)
+                ) {
+                    // Realtime fallback: sustained silence inside the tail window.
+                    if (readyNextTrack == null) promoteForcedLocked()
+                    return PollAction.AdvanceNext
+                } else if (readyNextTrack == null && pendingNextTrack != null && pos >= duration - 500) {
+                    // Analysis still running at file end: advance anyway (degraded, no trim).
+                    promoteForcedLocked()
+                    return PollAction.AdvanceNext
                 }
-            } else if (xfadeActive && xfadeHandoffMs >= 0 && pos >= xfadeHandoffMs) {
-                // `FINISHED` occurs at the physical file end. Switch at the
-                // audible end instead, so detected trailing silence is gone.
-                doHandoffLocked()
-            } else {
-                tailWatch = false
+            } else if (silenceSkipEnabled &&
+                tailCutter.shouldCut(pos, -1, tailConfirmMs, silenceTailScanMs)
+            ) {
+                // Streams have no pre-analysis tail; realtime is the only signal.
+                if (readyNextTrack == null) promoteForcedLocked()
+                return PollAction.AdvanceNext
             }
+            return PollAction.None
+        } else if (xfadeActive && xfadeHandoffMs >= 0 && pos >= xfadeHandoffMs) {
+            // `FINISHED` occurs at the physical file end. Switch at the
+            // audible end instead, so detected trailing silence is gone.
+            return PollAction.Handoff
+        } else {
+            tailWatch = false
+            return PollAction.None
         }
     }
 
@@ -332,44 +427,53 @@ class GuildMixer(
     fun isSubBusy(): Boolean = synchronized(lock) { overlayActive || xfadeActive || analysisActive }
 
     fun startOverlay(track: AudioTrack, duck: Float): AudioTrack {
-        synchronized(lock) {
+        val sub = synchronized(lock) {
             if (overlayActive || xfadeActive) throw MixerBusyException("secondary player busy on guild $guildId")
-            val sub = ensureSubLocked()
+            val s = ensureSubLocked()
             announceToken++
             subTrack = track
             overlayActive = true
             subStartMs = System.currentTimeMillis()
             siphon.clear()
-            sub.playTrack(track)
             mainGain.rampTo(duck.coerceIn(0f, 1f), msToSamples(duckFadeMs))
             subGain.setNow(0f)
             subGain.rampTo(1f, msToSamples(150))
-            log.info("overlay '{}' started on guild {}", track.info.title, guildId)
-            return track
+            s
         }
+        try {
+            sub.playTrack(track)
+        } catch (e: Exception) {
+            log.warn("overlay play failed on guild {}", guildId, e)
+            finishOverlay()
+            throw e
+        }
+        log.info("overlay '{}' started on guild {}", track.info.title, guildId)
+        return track
     }
 
-    fun cancelOverlay(): Boolean = synchronized(lock) {
-        if (!overlayActive) return false
-        try {
-            subPlayer?.stopTrack()
-        } finally {
-            finishOverlayLocked()
+    fun cancelOverlay(): Boolean {
+        val sub = synchronized(lock) {
+            if (!overlayActive) return false
+            subPlayer
         }
-        true
+        try {
+            sub?.stopTrack()
+        } finally {
+            finishOverlay()
+        }
+        return true
     }
 
     fun destroy() {
-        synchronized(lock) {
-            try {
-                subPlayer?.destroy()
-            } catch (e: Exception) {
-                log.warn("sub destroy failed on guild {}", guildId, e)
-            } finally {
-                subPlayer = null
-                pendingNextTrack = null
-                readyNextTrack = null
-            }
+        val sub = synchronized(lock) {
+            pendingNextTrack = null
+            readyNextTrack = null
+            subPlayer.also { subPlayer = null }
+        }
+        try {
+            sub?.destroy()
+        } catch (e: Exception) {
+            log.warn("sub destroy failed on guild {}", guildId, e)
         }
     }
 
@@ -388,104 +492,152 @@ class GuildMixer(
         return sub
     }
 
-    private fun startOverlapLocked(plan: CrossfadePlan) {
-        val next = readyNextTrack ?: pendingNextTrack ?: return
-        readyNextTrack = null
-        pendingNextTrack = null
-        val sub = ensureSubLocked()
-        applyLeadLocked(next)
-        subTrack = next
-        overlayActive = false
-        xfadeActive = true
-        xfadeHandoffMs = plan.handoffMs
-        subOutputSamples = 0L
-        subStartPositionMs = safePosition(next)
-        siphon.clear()
-        sub.playTrack(next)
-        xfadeTotal = msToSamples(plan.durationMs).coerceAtLeast(1)
-        xfadeLeft = xfadeTotal
+    private fun startOverlap(plan: CrossfadePlan) {
+        // Pop the slot first; seeks and playTrack run outside the lock.
+        val next = synchronized(lock) {
+            val n = readyNextTrack ?: pendingNextTrack ?: return
+            readyNextTrack = null
+            pendingNextTrack = null
+            n
+        }
+        seekPastLead(next)
+        val sub = synchronized(lock) { ensureSubLocked() }
+        synchronized(lock) {
+            if (overlayActive || xfadeActive) {
+                // Lost a race with an overlay/overlap started on another thread:
+                // re-queue rather than dropping the track.
+                if (readyNextTrack == null) readyNextTrack = next
+                else if (pendingNextTrack == null) pendingNextTrack = next
+                else log.warn("dropping overlapped queue on guild {}: slot busy", guildId)
+                return
+            }
+            subTrack = next
+            overlayActive = false
+            xfadeActive = true
+            xfadeHandoffMs = plan.handoffMs
+            subOutputSamples.set(0L)
+            subStartPositionMs = safePosition(next)
+            siphon.clear()
+            xfadeTotal = msToSamples(plan.durationMs).coerceAtLeast(1)
+            xfadeLeft = xfadeTotal
+        }
+        try {
+            sub.playTrack(next)
+        } catch (e: Exception) {
+            log.warn("overlap play failed on guild {}", guildId, e)
+            abortXfade("overlap play failed")
+            return
+        }
         log.info(
             "crossfade started on guild {} at {}ms; handoff at {}ms ({}ms audible overlap)",
             guildId, plan.startMs, plan.handoffMs, plan.durationMs
         )
     }
 
-    private fun doHandoffLocked() {
-        val sub = subTrack
-        xfadeActive = false
-        xfadeHandoffMs = -1L
-        if (sub == null) {
-            resetGainsLocked()
-            return
-        }
-        val clone = sub.makeClone()
-        val outputPosition = subStartPositionMs + subOutputSamples * 1000L / SAMPLE_RATE
+    private data class Handoff(val source: AudioTrack, val clone: AudioTrack, val outputPosition: Long)
+
+    private fun doHandoff() {
+        val plan = synchronized(lock) {
+            val sub = subTrack
+            xfadeActive = false
+            xfadeHandoffMs = -1L
+            if (sub == null) {
+                resetGainsLocked()
+                null
+            } else {
+                val clone = sub.makeClone()
+                val outputPosition = subStartPositionMs + subOutputSamples.get() * 1000L / SAMPLE_RATE
+                Handoff(sub, clone, outputPosition)
+            }
+        } ?: return
         try {
-            if (clone.isSeekable) {
-                val duration = clone.duration
-                clone.position = if (duration > 0) {
-                    outputPosition.coerceIn(0, duration)
+            if (plan.clone.isSeekable) {
+                val duration = plan.clone.duration
+                plan.clone.position = if (duration > 0) {
+                    plan.outputPosition.coerceIn(0, duration)
                 } else {
-                    outputPosition.coerceAtLeast(0)
+                    plan.outputPosition.coerceAtLeast(0)
                 }
             }
         } catch (e: Exception) {
             log.warn("handoff seek failed on guild {}, starting from 0", guildId, e)
         }
-        stopSubLocked()
+        val sub = synchronized(lock) { subPlayer }
+        try {
+            sub?.stopTrack()
+        } catch (e: Exception) {
+            log.warn("sub stop failed on guild {}", guildId, e)
+        }
         siphon.clear()
         subGain.setNow(0f)
         mainGain.setNow(0f)
         mainGain.rampTo(1f, msToSamples(maskMs).coerceAtLeast(1))
-        masking = true
         tailCutter.reset()
         try {
-            main?.play(clone)
-            log.info("crossfade handoff on guild {} at {}ms", guildId, outputPosition)
+            // Volatile read: attachMain publishes the player safely.
+            main?.play(plan.clone)
+            log.info("crossfade handoff on guild {} at {}ms", guildId, plan.outputPosition)
+            synchronized(lock) {
+                // Only clear our own slot; a newer overlap may already reuse it.
+                if (subTrack === plan.source) subTrack = null
+                // Marks the next main onTrackStart as ours so it skips the fade-in.
+                masking = true
+            }
         } catch (e: Exception) {
             log.warn("handoff play failed on guild {}", guildId, e)
-            resetGainsLocked()
-        } finally {
-            subTrack = null
+            synchronized(lock) {
+                if (subTrack === plan.source) subTrack = null
+                masking = false
+                resetGainsLocked()
+            }
         }
     }
 
-    private fun abortXfadeLocked(reason: String) {
-        log.warn("crossfade aborted on guild {}: {}", guildId, reason)
-        xfadeActive = false
-        xfadeHandoffMs = -1L
-        subTrack = null
-        stopSubLocked()
-        siphon.clear()
-        mainGain.rampTo(1f, msToSamples(duckFadeMs))
-        subGain.setNow(0f)
-    }
-
-    private fun finishOverlayLocked() {
-        overlayActive = false
-        subTrack = null
-        stopSubLocked()
-        siphon.clear()
-        mainGain.rampTo(1f, msToSamples(duckFadeMs))
-        subGain.setNow(0f)
-    }
-
-    private fun stopSubLocked() {
+    private fun abortXfade(reason: String) {
+        val sub = synchronized(lock) {
+            log.warn("crossfade aborted on guild {}: {}", guildId, reason)
+            xfadeActive = false
+            xfadeHandoffMs = -1L
+            subTrack = null
+            siphon.clear()
+            mainGain.rampTo(1f, msToSamples(duckFadeMs))
+            subGain.setNow(0f)
+            subPlayer
+        }
         try {
-            subPlayer?.stopTrack()
+            sub?.stopTrack()
+        } catch (e: Exception) {
+            log.warn("sub stop failed on guild {}", guildId, e)
+        }
+    }
+
+    private fun finishOverlay() {
+        val sub = synchronized(lock) {
+            overlayActive = false
+            subTrack = null
+            siphon.clear()
+            mainGain.rampTo(1f, msToSamples(duckFadeMs))
+            subGain.setNow(0f)
+            subPlayer
+        }
+        try {
+            sub?.stopTrack()
         } catch (e: Exception) {
             log.warn("sub stop failed on guild {}", guildId, e)
         }
     }
 
     /** Plays the queued track now, seeking past analyzed leading silence. */
-    private fun advanceNextLocked() {
-        val next = readyNextTrack ?: pendingNextTrack ?: return
-        readyNextTrack = null
-        pendingNextTrack = null
-        lastMainTrack = null
-        tailCutter.reset()
-        applyLeadLocked(next)
+    private fun advanceNext() {
+        val next = synchronized(lock) {
+            val n = readyNextTrack ?: pendingNextTrack ?: return
+            readyNextTrack = null
+            pendingNextTrack = null
+            lastMainTrack = null
+            tailCutter.reset()
+            n
+        }
+        seekPastLead(next)
         try {
             main?.play(next)
             log.debug("gapless advance on guild {}", guildId)
@@ -494,9 +646,9 @@ class GuildMixer(
         }
     }
 
-    private fun applyLeadLocked(track: AudioTrack) {
+    private fun seekPastLead(track: AudioTrack) {
         if (!silenceSkipEnabled) return
-        val lead = leadForLocked(track)
+        val lead = synchronized(lock) { leadForLocked(track) }
         if (lead > 200 && track.isSeekable) {
             try {
                 val duration = track.duration
@@ -582,6 +734,7 @@ class GuildMixer(
             }
             if (overlayActive || xfadeActive || analysisActive) return
             analysisActive = true
+            analysisBroken = false
         }
         try {
             val factory = synchronized(lock) { ensureSubLocked(); siphonFactory }
@@ -608,6 +761,13 @@ class GuildMixer(
                 head to t
             }
             val guardedLead = if (duration > 0 && lead >= duration - 500) 0 else lead.coerceAtLeast(0)
+            if (analysisBroken) {
+                // The sub decoder died mid-scan; partial PCM would poison the
+                // cache. Leave it uncached so a later preload retries, and let
+                // poll() degrade to an untrimmed advance at content end.
+                log.warn("silence analysis aborted on guild {}: sub decoder failed", guildId)
+                return
+            }
             synchronized(lock) {
                 trimCache[identifier] = TrimPoints(guardedLead, tail.coerceAtLeast(0))
                 while (trimCache.size > 200) trimCache.remove(trimCache.keys.first())
@@ -643,7 +803,7 @@ class GuildMixer(
             val cap = msToSamples(silenceHeadScanMs)
             var collected = 0
             val deadline = System.currentTimeMillis() + 45000
-            while (collected < cap && System.currentTimeMillis() < deadline) {
+            while (collected < cap && System.currentTimeMillis() < deadline && !analysisBroken) {
                 if (sub.playingTrack !== clone) break
                 if (tap.pendingFrames == 0) {
                     Thread.sleep(20)
@@ -729,7 +889,7 @@ class GuildMixer(
             val frames = mutableListOf<Array<FloatArray>>()
             var collected = 0
             val deadline = System.currentTimeMillis() + 45000
-            while (collected < capSamples && System.currentTimeMillis() < deadline) {
+            while (collected < capSamples && System.currentTimeMillis() < deadline && !analysisBroken) {
                 if (sub.playingTrack !== clone) break
                 if (tap.pendingFrames == 0) {
                     Thread.sleep(20)
