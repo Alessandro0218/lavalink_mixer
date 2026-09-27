@@ -68,5 +68,52 @@ class SiphonQueueTest {
         q.push(arrayOf(floatArrayOf(1f)), 0, 1)
         q.clear()
         assertEquals(0, q.pendingFrames)
+        assertEquals(0, q.pendingSamples)
+    }
+
+    @Test
+    fun `frame buffer prefill does not drop the head of the sub track`() {
+        // Lavaplayer fills the whole frame buffer the instant playTrack()
+        // returns, long before the mixer has consumed a single sample. With a
+        // frame-based cap sized for "a little slack" (150 frames) every 20ms
+        // source lost its first 2 seconds here — the crossfade then played
+        // track B from the middle and reported a handoff position that did
+        // not match what was actually heard.
+        val q = SiphonQueue.forFrameBuffer(5000)
+        val chunk = 960 // 20ms at 48kHz — what opus/webm sources emit
+        repeat(5000 / 20) { q.push(Array(2) { FloatArray(chunk) }, 0, chunk) }
+
+        assertEquals(0, q.droppedFrames, "sub track opening was dropped before the crossfade heard it")
+        assertEquals(0L, q.droppedSamples)
+        assertTrue(
+            q.pendingSamples >= 4000 * 48,
+            "expected most of the 5s prefill retained, got ${q.pendingSamples / 48}ms",
+        )
+    }
+
+    @Test
+    fun `sample accounting survives partial takes`() {
+        val q = SiphonQueue(maxSamples = 1000)
+        q.push(arrayOf(FloatArray(600)), 0, 600)
+        assertEquals(600, q.pendingSamples)
+        val out = Array(1) { FloatArray(250) }
+        assertEquals(250, q.take(250, 1, out))
+        assertEquals(350, q.pendingSamples)
+        // Over the cap: the oldest (partially consumed) frame goes first.
+        q.push(arrayOf(FloatArray(900)), 0, 900)
+        assertEquals(1, q.pendingFrames)
+        assertEquals(900, q.pendingSamples)
+        assertEquals(1L, q.droppedFrames)
+        assertEquals(350L, q.droppedSamples)
+    }
+
+    @Test
+    fun `unbounded frames still drop at the sample cap`() {
+        val q = SiphonQueue(maxSamples = 480)
+        repeat(10) { q.push(arrayOf(FloatArray(240)), 0, 240) }
+        assertEquals(2, q.pendingFrames)
+        assertEquals(480, q.pendingSamples)
+        assertEquals(8L, q.droppedFrames)
     }
 }
+

@@ -11,13 +11,28 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrack
  * Bounded FIFO of decoded float PCM chunks siphoned off the secondary
  * (overlay/crossfade) player. The mixer filter on the main player drains it.
  * Overflow drops the oldest audio; underflow reads as silence.
+ *
+ * The bound is in *samples*, not frames: a decoder chunk is not a time unit.
+ * Opus/webm sources emit 20ms chunks (960 samples), WAV ~85ms (4096), so a
+ * frame cap silently changes meaning per source. More importantly the moment
+ * `playTrack()` returns Lavaplayer fills the whole frame buffer
+ * (`frameBufferDuration`, 5000ms by default) as fast as it can decode — none
+ * of which the mixer has consumed yet. A frame-based cap therefore throws
+ * away the opening seconds of every overlaid track before the crossfade
+ * hears them. Size the default from the frame buffer instead.
  */
-class SiphonQueue(private val maxFrames: Int = 150) {
+class SiphonQueue(
+    private val maxFrames: Int = Int.MAX_VALUE,
+    private val maxSamples: Int = DEFAULT_MAX_SAMPLES,
+) {
     private data class Frame(val channels: Array<FloatArray>, var offset: Int = 0)
 
     private val lock = Any()
     private val deque = ArrayDeque<Frame>()
+    private var queuedSamples: Int = 0
     var droppedFrames: Long = 0L
+        private set
+    var droppedSamples: Long = 0L
         private set
 
     fun push(input: Array<FloatArray>, offset: Int, length: Int) {
@@ -25,9 +40,13 @@ class SiphonQueue(private val maxFrames: Int = 150) {
         val copy = Array(input.size) { c -> input[c].copyOfRange(offset, offset + length) }
         synchronized(lock) {
             deque.addLast(Frame(copy))
-            while (deque.size > maxFrames) {
-                deque.removeFirst()
+            queuedSamples += length
+            while ((deque.size > maxFrames || queuedSamples > maxSamples) && deque.isNotEmpty()) {
+                val head = deque.removeFirst()
+                val remaining = head.channels[0].size - head.offset
+                queuedSamples -= remaining
                 droppedFrames++
+                droppedSamples += remaining.toLong()
             }
         }
     }
@@ -48,6 +67,7 @@ class SiphonQueue(private val maxFrames: Int = 150) {
                 }
                 // Channels the sub stream lacks stay silent (already zero-filled).
                 head.offset += n
+                queuedSamples -= n
                 if (head.offset >= head.channels[0].size) deque.removeFirst()
                 remaining -= n
                 outOffset += n
@@ -57,15 +77,30 @@ class SiphonQueue(private val maxFrames: Int = 150) {
                     out[c].fill(0f, outOffset, outOffset + remaining)
                 }
             }
-            return samples - remaining
+            return outOffset
         }
     }
 
     fun clear() {
-        synchronized(lock) { deque.clear() }
+        synchronized(lock) {
+            deque.clear()
+            queuedSamples = 0
+        }
     }
 
     val pendingFrames: Int get() = synchronized(lock) { deque.size }
+
+    /** Decoded-but-not-yet-mixed audio, in samples per channel. */
+    val pendingSamples: Int get() = synchronized(lock) { queuedSamples }
+
+    companion object {
+        /** 8s at 48kHz: comfortably above a default 5s frame-buffer prefill. */
+        const val DEFAULT_MAX_SAMPLES: Int = 8000 * 48
+
+        /** Holds a whole frame-buffer prefill plus slack for the live backlog. */
+        fun forFrameBuffer(frameBufferMs: Int): SiphonQueue =
+            SiphonQueue(maxSamples = ((frameBufferMs + 3000).coerceAtLeast(DEFAULT_MAX_SAMPLES / 48)) * 48)
+    }
 }
 
 /**
