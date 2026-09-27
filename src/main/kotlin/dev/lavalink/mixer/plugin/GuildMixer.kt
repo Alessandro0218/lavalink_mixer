@@ -87,6 +87,16 @@ class GuildMixer(
     private var lastMainTrack: AudioTrack? = null
     private var lastPosition: Long = 0L
 
+    /** Ticks once per mixer-filter chunk; see [checkFilterHeartbeatLocked]. */
+    private val filterRunCount = AtomicLong(0L)
+    private var filterRunBaseline = 0L
+    private var filterBaselinePos = 0L
+    @Volatile private var filterMissing: Boolean = false
+    private var filterMissingWarned: Boolean = false
+    private val underrunWarnAt = AtomicLong(0L)
+    /** Only touched from [poll], which the single mixer-loop thread drives. */
+    private var xfadeLogMs: Long = 0L
+
     private val mainGain = GainRamp(1f)
     private val subGain = GainRamp(0f)
     /** Written by the voice thread every chunk; control plane only (re)starts the fade. */
@@ -95,9 +105,9 @@ class GuildMixer(
     /** Set when the sub decoder reports stuck/exception mid-analysis so scans abort early. */
     @Volatile private var analysisBroken: Boolean = false
 
-    val siphon = SiphonQueue()
+    val siphon = SiphonQueue.forFrameBuffer(safeFrameBufferDurationMs())
     private val drainFrame = MutableAudioFrame().apply {
-        setBuffer(ByteBuffer.allocate(StandardAudioDataFormats.DISCORD_OPUS.maximumChunkSize()))
+        setBuffer(ByteBuffer.allocate(provideBufferSize()))
     }
 
     private data class StartSnap(val xfade: Boolean, val leadMs: Long, val fadeInMs: Long)
@@ -264,6 +274,35 @@ class GuildMixer(
     }
 
     /**
+     * Heartbeat from the voice path: the mixer filter processed a chunk.
+     * [checkFilterHeartbeatLocked] uses the absence of these to prove the
+     * filter never made it into the running track's chain.
+     */
+    fun noteFilterRun() {
+        filterRunCount.incrementAndGet()
+    }
+
+    /**
+     * Throttled voice-thread warning: an overlap is fading in but the
+     * secondary decoder did not supply the whole chunk, so the mix dropped
+     * to silence on the sub side for this frame.
+     */
+    fun noteUnderrun(missing: Int, requested: Int) {
+        if (!xfadeActive || missing <= 0) return
+        val now = System.currentTimeMillis()
+        val last = underrunWarnAt.get()
+        if (now - last < 1000 || !underrunWarnAt.compareAndSet(last, now)) return
+        log.warn(
+            "crossfade sub starvation on guild {}: {} of {} samples silent " +
+                "(pending={}f/{}ms dropped={}f/{}ms subOut={}ms)",
+            guildId, missing, requested,
+            siphon.pendingFrames, siphon.pendingSamples * 1000L / SAMPLE_RATE,
+            siphon.droppedFrames, siphon.droppedSamples,
+            subOutputSamples.get() * 1000L / SAMPLE_RATE,
+        )
+    }
+
+    /**
      * Threshold amp for realtime tail watching, or null when no peak
      * computation is needed this chunk (voice-thread fast path).
      */
@@ -291,6 +330,18 @@ class GuildMixer(
     }
 
     internal fun subOutputSamplesForTest(): Long = subOutputSamples.get()
+
+    internal fun filterRunsForTest(): Long = filterRunCount.get()
+
+    internal fun filterMissingForTest(): Boolean = filterMissing
+
+    /** Advances the heartbeat baseline as if a fresh main track just started. */
+    internal fun resetFilterHeartbeatForTest(position: Long = 0L) {
+        synchronized(lock) { resetFilterHeartbeatLocked(position) }
+    }
+
+    internal fun trimForTest(identifier: String): TrimPoints? =
+        synchronized(lock) { trimCache[identifier] }
 
     // ---- scheduler entry points ----
 
@@ -323,6 +374,8 @@ class GuildMixer(
      */
     fun poll() {
         val action = synchronized(lock) { decidePollLocked() }
+        // Read the transition state before acting on it: doHandoff clears it.
+        if (xfadeActive) logXfadeProgress(action)
         when (action) {
             is PollAction.None -> Unit
             is PollAction.StartOverlap -> startOverlap(action.plan)
@@ -330,6 +383,33 @@ class GuildMixer(
             is PollAction.AdvanceNext -> advanceNext()
             is PollAction.AbortXfade -> abortXfade(action.reason)
         }
+    }
+
+    /** 1Hz breadcrumb while an overlap runs: is the sub actually feeding us? */
+    private fun logXfadeProgress(action: PollAction) {
+        val now = System.currentTimeMillis()
+        if (now - xfadeLogMs < 1000) return
+        xfadeLogMs = now
+        val track = main?.audioPlayer?.playingTrack ?: return
+        val pos = safePosition(track)
+        val handoff: Long
+        val subPos: Long
+        val subOutMs: Long
+        synchronized(lock) {
+            handoff = xfadeHandoffMs
+            subPos = subTrack?.let { safePosition(it) } ?: -1L
+            subOutMs = subOutputSamples.get()
+        }
+        log.info(
+            "crossfade progress guild {} at {}ms/handoff {}ms ({}ms left, action={}): " +
+                "pending={}f/{}ms dropped={}f subOut={}ms subPos={}ms mixerFilterCalls={}",
+            guildId, pos, handoff, (handoff - pos).coerceAtLeast(0), action,
+            siphon.pendingFrames, siphon.pendingSamples * 1000L / SAMPLE_RATE,
+            siphon.droppedFrames,
+            subOutMs * 1000L / SAMPLE_RATE,
+            subPos,
+            filterRunCount.get(),
+        )
     }
 
     private fun decidePollLocked(): PollAction {
@@ -341,15 +421,18 @@ class GuildMixer(
         if (track !== lastMainTrack) {
             lastMainTrack = track
             lastPosition = safePosition(track)
+            resetFilterHeartbeatLocked(lastPosition)
             return PollAction.None
         }
         val pos = safePosition(track)
         if (pos < lastPosition - 1500) {
             // User seeked backwards: any armed overlap is stale.
             tailCutter.reset()
+            resetFilterHeartbeatLocked(pos)
             if (xfadeActive) return PollAction.AbortXfade("seek during crossfade")
         }
         lastPosition = pos
+        checkFilterHeartbeatLocked(audioPlayer, pos)
         // Opportunistic promotion: analysis may have finished since queue.
         promoteIfPendingLocked()
         if (!xfadeActive && (readyNextTrack != null || pendingNextTrack != null)) {
@@ -395,6 +478,45 @@ class GuildMixer(
             tailWatch = false
             return PollAction.None
         }
+    }
+
+    private fun resetFilterHeartbeatLocked(position: Long) {
+        filterRunBaseline = filterRunCount.get()
+        filterBaselinePos = position
+        filterMissing = false
+        filterMissingWarned = false
+    }
+
+    /**
+     * A main track whose position keeps advancing while [filterRunCount]
+     * never moves means Lavaplayer built this chain without our filter: the
+     * client sent `play` before `filters`, or never sent `pluginFilters.mixer`
+     * at all. Lavaplayer does not hot-swap filter factories into a running
+     * track, so the crossfade then only ever computes gains nobody applies —
+     * the exact symptom of "track A plays to the end, B starts afterwards
+     * from zero". Say so loudly instead of failing silently.
+     */
+    private fun checkFilterHeartbeatLocked(audioPlayer: AudioPlayer, pos: Long) {
+        val runs = filterRunCount.get()
+        if (runs != filterRunBaseline) {
+            if (filterMissing) {
+                filterMissing = false
+                log.info("mixer filter is live on guild {} ({} chunks since track start)", guildId, runs - filterRunBaseline)
+            }
+            return
+        }
+        if (filterMissingWarned || main == null || audioPlayer.isPaused) return
+        val played = pos - filterBaselinePos
+        if (played < 1000) return
+        filterMissingWarned = true
+        filterMissing = true
+        log.warn(
+            "mixer filter is NOT in the running track's chain on guild {}: {}ms decoded, " +
+                "0 mixer filter calls. Send the `filters` op with pluginFilters.mixer BEFORE " +
+                "`play` (or re-send `filters` and seek) — Lavalink does not rebuild the chain " +
+                "of a track that is already playing.",
+            guildId, played,
+        )
     }
 
     // ---- control-plane entry points (REST) ----
@@ -480,6 +602,72 @@ class GuildMixer(
 
     // ---- internals (all called under lock) ----
 
+    /**
+     * How much decoded audio Lavaplayer pre-buffers into a track's frame
+     * buffer before anyone pulls a frame. The siphon has to be able to hold
+     * all of it, or the first seconds of an overlaid track are dropped the
+     * instant playTrack() returns. Guarded because tests build mixers over
+     * stub managers.
+     */
+    private fun safeFrameBufferDurationMs(): Int = try {
+        playerManager.frameBufferDuration
+    } catch (t: Throwable) {
+        DEFAULT_FRAME_BUFFER_MS
+    }
+
+    /**
+     * A provide() frame must hold one whole encoded chunk of the *manager's*
+     * output format. Sizing it from DISCORD_OPUS while the server emits PCM
+     * overflows on every frame, [drain] then logs and drops each attempt, the
+     * secondary decoder never advances — and the crossfade degenerates into
+     * "the old track plays out, the new one starts after". Also guarded:
+     * tests build mixers over stub managers.
+     */
+    private fun provideBufferSize(): Int = try {
+        playerManager.configuration?.outputFormat?.maximumChunkSize()
+            ?: StandardAudioDataFormats.DISCORD_OPUS.maximumChunkSize()
+    } catch (t: Throwable) {
+        StandardAudioDataFormats.DISCORD_OPUS.maximumChunkSize()
+    }
+
+    /** Separate buffer from [drainFrame]: analysis runs on its own thread. */
+    private fun newProvideFrame(): MutableAudioFrame = MutableAudioFrame().apply {
+        setBuffer(ByteBuffer.allocate(provideBufferSize()))
+    }
+
+    /** @return false when the sub's frame buffer had nothing to give. */
+    private fun pumpAnalysis(sub: AudioPlayer, frame: MutableAudioFrame): Boolean = try {
+        sub.provide(frame)
+    } catch (e: Exception) {
+        analysisBroken = true
+        log.warn("analysis pump failed on guild {}", guildId, e)
+        false
+    }
+
+    /**
+     * Keeps the secondary decoder moving while a scan runs. Nothing else
+     * does: Lavaplayer fills the frame buffer once (frameBufferDuration) and
+     * then blocks until somebody calls provide(), and the mixer-loop's
+     * [drain] only ticks ~50Hz on whatever happens to be playing. Without
+     * this the scan collects a single buffer's worth of audio and then sits
+     * on an empty tap until its 45s deadline, which either truncates the
+     * trim or stalls every preload by 45 seconds. The frames pulled here are
+     * discarded — the tap, not the frame buffer, is the scan's data source.
+     */
+    private fun pumpSub(sub: AudioPlayer, frame: MutableAudioFrame) {
+        var burst = 0
+        while (burst < ANALYSIS_PUMP_BURST && !analysisBroken) {
+            if (!pumpAnalysis(sub, frame)) break
+            burst++
+        }
+        try {
+            Thread.sleep(if (burst > 0) ANALYSIS_PUMP_SLEEP_MS else ANALYSIS_IDLE_SLEEP_MS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            analysisBroken = true
+        }
+    }
+
     private fun ensureSubLocked(): AudioPlayer {
         var sub = subPlayer
         if (sub == null) {
@@ -518,9 +706,11 @@ class GuildMixer(
             xfadeHandoffMs = plan.handoffMs
             subOutputSamples.set(0L)
             subStartPositionMs = safePosition(next)
+            subStartMs = System.currentTimeMillis()
             siphon.clear()
             xfadeTotal = msToSamples(plan.durationMs).coerceAtLeast(1)
             xfadeLeft = xfadeTotal
+            xfadeLogMs = 0L
         }
         try {
             sub.playTrack(next)
@@ -530,15 +720,34 @@ class GuildMixer(
             return
         }
         log.info(
-            "crossfade started on guild {} at {}ms; handoff at {}ms ({}ms audible overlap)",
-            guildId, plan.startMs, plan.handoffMs, plan.durationMs
+            "crossfade started on guild {} at {}ms; handoff at {}ms ({}ms audible overlap); " +
+                "sub track '{}' @{}ms, mixerFilterCalls={}",
+            guildId, plan.startMs, plan.handoffMs, plan.durationMs,
+            titleOf(next), subStartPositionMs, filterRunCount.get(),
         )
     }
 
-    private data class Handoff(val source: AudioTrack, val clone: AudioTrack, val outputPosition: Long)
+    private fun titleOf(track: AudioTrack): String =
+        try { track.info.title ?: track.info.identifier } catch (e: Exception) { "unknown" }
+
+    private data class Handoff(
+        val source: AudioTrack,
+        val clone: AudioTrack,
+        val outputPosition: Long,
+        val subReportedMs: Long,
+        val subOutMs: Long,
+        val droppedFrames: Long,
+    )
 
     private fun doHandoff() {
         val plan = synchronized(lock) {
+            // poll(), mainListener.onTrackEnd and recoverFromMainStall all read
+            // xfadeActive under the lock and then call us *after* releasing it.
+            // A main track hitting FINISHED at the exact handoff position can
+            // therefore race the position-based handoff; without this guard the
+            // second caller replays the whole transition and throws away the
+            // mask ramp it just armed.
+            if (!xfadeActive) return
             val sub = subTrack
             xfadeActive = false
             xfadeHandoffMs = -1L
@@ -547,8 +756,15 @@ class GuildMixer(
                 null
             } else {
                 val clone = sub.makeClone()
-                val outputPosition = subStartPositionMs + subOutputSamples.get() * 1000L / SAMPLE_RATE
-                Handoff(sub, clone, outputPosition)
+                val subOutMs = subOutputSamples.get() * 1000L / SAMPLE_RATE
+                Handoff(
+                    source = sub,
+                    clone = clone,
+                    outputPosition = subStartPositionMs + subOutMs,
+                    subReportedMs = safePosition(sub),
+                    subOutMs = subOutMs,
+                    droppedFrames = siphon.droppedFrames,
+                )
             }
         } ?: return
         try {
@@ -574,16 +790,23 @@ class GuildMixer(
         mainGain.setNow(0f)
         mainGain.rampTo(1f, msToSamples(maskMs).coerceAtLeast(1))
         tailCutter.reset()
+        // Arm the mask BEFORE play(): Lavaplayer dispatches TrackStart
+        // synchronously from playTrack(), so a flag set afterwards is too late.
+        // An unmasked onTrackStart re-seeks the clone to its leading-silence
+        // offset, rewinding the whole overlap the crossfade just built.
+        synchronized(lock) {
+            // Only clear our own slot; a newer overlap may already reuse it.
+            if (subTrack === plan.source) subTrack = null
+            masking = true
+        }
         try {
             // Volatile read: attachMain publishes the player safely.
             main?.play(plan.clone)
-            log.info("crossfade handoff on guild {} at {}ms", guildId, plan.outputPosition)
-            synchronized(lock) {
-                // Only clear our own slot; a newer overlap may already reuse it.
-                if (subTrack === plan.source) subTrack = null
-                // Marks the next main onTrackStart as ours so it skips the fade-in.
-                masking = true
-            }
+            log.info(
+                "crossfade handoff on guild {} at {}ms (sub decoder was at {}ms, " +
+                    "{}ms of sub audio heard, {} frames dropped)",
+                guildId, plan.outputPosition, plan.subReportedMs, plan.subOutMs, plan.droppedFrames,
+            )
         } catch (e: Exception) {
             log.warn("handoff play failed on guild {}", guildId, e)
             synchronized(lock) {
@@ -596,7 +819,15 @@ class GuildMixer(
 
     private fun abortXfade(reason: String) {
         val sub = synchronized(lock) {
-            log.warn("crossfade aborted on guild {}: {}", guildId, reason)
+            val subPosMs = subTrack?.let { safePosition(it) } ?: -1L
+            val subOutMs = subOutputSamples.get() * 1000L / SAMPLE_RATE
+            val elapsed = if (subStartMs > 0) System.currentTimeMillis() - subStartMs else -1L
+            log.warn(
+                "crossfade aborted on guild {} after {}ms: {} " +
+                    "(subPos={}ms subOut={}ms pending={}f dropped={}f)",
+                guildId, elapsed, reason, subPosMs, subOutMs,
+                siphon.pendingFrames, siphon.droppedFrames,
+            )
             xfadeActive = false
             xfadeHandoffMs = -1L
             subTrack = null
@@ -803,11 +1034,12 @@ class GuildMixer(
             )
             val cap = msToSamples(silenceHeadScanMs)
             var collected = 0
+            val pumpFrame = newProvideFrame()
             val deadline = System.currentTimeMillis() + 45000
             while (collected < cap && System.currentTimeMillis() < deadline && !analysisBroken) {
                 if (sub.playingTrack !== clone) break
                 if (tap.pendingFrames == 0) {
-                    Thread.sleep(20)
+                    pumpSub(sub, pumpFrame)
                     continue
                 }
                 while (tap.pendingFrames > 0 && collected < cap) {
@@ -889,11 +1121,12 @@ class GuildMixer(
             sub.playTrack(clone)
             val frames = mutableListOf<Array<FloatArray>>()
             var collected = 0
+            val pumpFrame = newProvideFrame()
             val deadline = System.currentTimeMillis() + 45000
             while (collected < capSamples && System.currentTimeMillis() < deadline && !analysisBroken) {
                 if (sub.playingTrack !== clone) break
                 if (tap.pendingFrames == 0) {
-                    Thread.sleep(20)
+                    pumpSub(sub, pumpFrame)
                     continue
                 }
                 while (tap.pendingFrames > 0 && collected < capSamples) {
@@ -925,6 +1158,12 @@ class GuildMixer(
     companion object {
         private val log = LoggerFactory.getLogger(GuildMixer::class.java)
         private const val SAMPLE_RATE = 48000
+
+        /** Lavaplayer's default frame buffer; used when the manager can't say. */
+        private const val DEFAULT_FRAME_BUFFER_MS = 5000
+        private const val ANALYSIS_PUMP_BURST = 8
+        private const val ANALYSIS_PUMP_SLEEP_MS = 10L
+        private const val ANALYSIS_IDLE_SLEEP_MS = 20L
 
         fun msToSamples(ms: Long): Int = ((ms.coerceAtLeast(0) * SAMPLE_RATE) / 1000).toInt().coerceAtLeast(1)
     }
