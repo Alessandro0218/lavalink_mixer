@@ -16,6 +16,14 @@ import kotlin.math.abs
  * the chain is severed: no frame ever reaches the buffer and Lavaplayer
  * reports a healthy track as stuck.
  *
+ * The [GuildMixer] is resolved through [mixerProvider] on every chunk rather
+ * than captured at build time. The factory is only consulted once, when the
+ * track starts; capturing then would pin whatever instance existed at that
+ * instant, and a guild mixer that is created (or replaced) afterwards would
+ * never see a single sample — a silent "crossfade that only starts the next
+ * track when the old one ends". Resolving costs one ConcurrentHashMap read
+ * per 20ms chunk.
+ *
  * output = main * mainGain + sub * subGain, clamped to [-1, 1].
  * Gains are advanced once per process() call (per chunk, not per sample);
  * with ~20ms chunks that is ~50 gain steps/second, free of zipper noise
@@ -27,26 +35,40 @@ import kotlin.math.abs
  * the worst case is unmixed audio, never silence.
  */
 class MixerFilter(
-    private val mixer: GuildMixer,
+    private val guildId: Long,
+    private val mixerProvider: () -> GuildMixer?,
     private val downstream: FloatPcmAudioFilter?,
 ) : FloatPcmAudioFilter {
+
+    constructor(mixer: GuildMixer, downstream: FloatPcmAudioFilter?) : this(mixer.guildId, { mixer }, downstream)
+
     override fun process(input: Array<FloatArray>, offset: Int, length: Int) {
         if (length <= 0) return
+        val mixer = mixerProvider()
+        if (mixer == null) {
+            warnUnbound()
+            downstream?.process(input, offset, length)
+            return
+        }
+        // Heartbeat for GuildMixer's "is this filter actually in the chain"
+        // probe: a playing track whose position advances while this never
+        // ticks means the filters op never reached the running track.
+        mixer.noteFilterRun()
         try {
-            mixInto(input, offset, length)
+            mixInto(mixer, input, offset, length)
         } catch (e: Exception) {
             // Leave input (possibly) untouched and throttle the log:
             // this runs ~50x/sec, so only the first occurrence per minute.
             if (now() - lastWarn >= 60_000) {
                 lastWarn = now()
-                log.warn("mixer filter failed, degrading to passthrough", e)
+                log.warn("mixer filter failed on guild {}, degrading to passthrough", guildId, e)
             }
         }
         // Always forward, even after a mixer failure — stock chain semantics.
         downstream?.process(input, offset, length)
     }
 
-    private fun mixInto(input: Array<FloatArray>, offset: Int, length: Int) {
+    private fun mixInto(mixer: GuildMixer, input: Array<FloatArray>, offset: Int, length: Int) {
         // Realtime tail watch runs on the raw main input, before gains.
         mixer.realtimeTailAmp()?.let { thresholdAmp ->
             var peak = 0f
@@ -81,6 +103,7 @@ class MixerFilter(
         val sub = Array(input.size) { FloatArray(length) }
         val subSamples = mixer.takeSub(length, input.size, sub)
         mixer.noteSubOutput(subSamples)
+        if (subSamples < length) mixer.noteUnderrun(length - subSamples, length)
 
         for (c in input.indices) {
             val channel = input[c]
@@ -91,6 +114,13 @@ class MixerFilter(
                 channel[i] = mixed.coerceIn(-1f, 1f)
             }
         }
+    }
+
+    private fun warnUnbound() {
+        val t = now()
+        if (t - lastWarn < 60_000) return
+        lastWarn = t
+        log.warn("mixer filter for guild {} has no GuildMixer; passing audio through untouched", guildId)
     }
 
     // Lifecycle events are delivered to every filter in the pipeline by
