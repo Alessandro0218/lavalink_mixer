@@ -1,6 +1,7 @@
 package dev.lavalink.mixer.plugin
 
 import com.sedmelluq.discord.lavaplayer.filter.FloatPcmAudioFilter
+import org.slf4j.LoggerFactory
 import kotlin.math.abs
 
 /**
@@ -11,10 +12,27 @@ import kotlin.math.abs
  * Gains are advanced once per process() call (per chunk, not per sample);
  * with ~20ms chunks that is ~50 gain steps/second, free of zipper noise
  * for ramps >= 80ms. When idle (main=1, sub=0) this is a pure passthrough.
+ *
+ * Never lets mixer bugs break main output: any failure degrades to
+ * passthrough (and is logged) instead of killing the frame, which
+ * Lavaplayer would otherwise report as TrackStuck.
  */
 class MixerFilter(private val mixer: GuildMixer) : FloatPcmAudioFilter {
     override fun process(input: Array<FloatArray>, offset: Int, length: Int) {
         if (length <= 0) return
+        try {
+            processUnsafe(input, offset, length)
+        } catch (e: Exception) {
+            // Leave input untouched (passthrough) and throttle the log:
+            // this runs ~50x/sec, so only the first occurrence per minute.
+            if (now() - lastWarn >= 60_000) {
+                lastWarn = now()
+                log.warn("mixer filter failed, degrading to passthrough", e)
+            }
+        }
+    }
+
+    private fun processUnsafe(input: Array<FloatArray>, offset: Int, length: Int) {
         // Realtime tail watch runs on the raw main input, before gains.
         mixer.realtimeTailAmp()?.let { thresholdAmp ->
             var peak = 0f
@@ -67,4 +85,13 @@ class MixerFilter(private val mixer: GuildMixer) : FloatPcmAudioFilter {
     override fun flush() = Unit
 
     override fun close() = Unit
+
+    companion object {
+        private val log = LoggerFactory.getLogger(MixerFilter::class.java)
+
+        @Volatile
+        private var lastWarn: Long = 0L
+
+        private fun now(): Long = System.currentTimeMillis()
+    }
 }
