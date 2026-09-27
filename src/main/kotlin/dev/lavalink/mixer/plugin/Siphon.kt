@@ -70,13 +70,21 @@ class SiphonQueue(private val maxFrames: Int = 150) {
 
 /**
  * Capture filter for the secondary player: copies PCM into every attached
- * tap queue and passes audio through untouched (its encoded output is
- * drained and discarded). The primary tap feeds the live mixer; analysis
- * taps are attached temporarily so scanning never steals live audio.
+ * tap queue and forwards it downstream to the frame buffer. Forwarding is
+ * required by Lavaplayer's chain protocol (data only flows through
+ * build-time downstream references); without it the sub decoder free-runs,
+ * the bounded queue only ever holds the tail of the track, and the sub
+ * player's own provide() stays empty (its drain does nothing).
+ * The primary tap feeds the live mixer; analysis taps are attached
+ * temporarily so scanning never steals live audio.
  */
-class SiphonFilter(private val taps: List<SiphonQueue>) : FloatPcmAudioFilter {
+class SiphonFilter(
+    private val taps: List<SiphonQueue>,
+    private val downstream: UniversalPcmAudioFilter?,
+) : FloatPcmAudioFilter {
     override fun process(input: Array<FloatArray>, offset: Int, length: Int) {
         for (queue in taps) queue.push(input, offset, length)
+        downstream?.process(input, offset, length)
     }
 
     override fun seekPerformed(requestedTime: Long, providedTime: Long) {
@@ -105,5 +113,5 @@ class SiphonFactory(primary: SiphonQueue) : PcmFilterFactory {
         track: AudioTrack?,
         format: AudioDataFormat,
         output: UniversalPcmAudioFilter,
-    ): MutableList<AudioFilter> = mutableListOf(SiphonFilter(taps.toList()))
+    ): MutableList<AudioFilter> = mutableListOf(SiphonFilter(taps.toList(), output))
 }

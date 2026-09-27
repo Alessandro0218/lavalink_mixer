@@ -38,7 +38,7 @@ class MixerFilterExtension(private val plugin: MixerPlugin) : AudioFilterExtensi
             log.warn("mixer filter enabled for unknown guild {}, check REST state first", guildId)
             return null
         }
-        return mixer.newFilter()
+        return mixer.newFilter(output)
     }
 
     private fun guildIdOf(obj: JsonObject): Long? =

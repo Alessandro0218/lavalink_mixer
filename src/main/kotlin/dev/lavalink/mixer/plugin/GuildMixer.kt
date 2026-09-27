@@ -229,7 +229,8 @@ class GuildMixer(
         }
     }
 
-    fun newFilter(): MixerFilter = MixerFilter(this)
+    fun newFilter(downstream: com.sedmelluq.discord.lavaplayer.filter.FloatPcmAudioFilter? = null): MixerFilter =
+        MixerFilter(this, downstream)
 
     // ---- voice-thread entry points ----
 

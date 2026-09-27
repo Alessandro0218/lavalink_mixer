@@ -70,7 +70,9 @@ audible source must be mixed **before encoding**. The plugin:
 2. Siphons its decoded float PCM into a bounded queue (`SiphonFilter`); a
    shared pump thread drains the decoder so it keeps flowing.
 3. Mixes that PCM into the main player's filter chain via the `"mixer"`
-   `AudioFilterExtension` (runs after volume/EQ, pre-encode):
+   `AudioFilterExtension` — Lavaplayer feeds the chain head from the decoder,
+   so the mixer runs first on raw PCM (before volume/EQ filters), and mixed
+   chunks are forwarded through the rest of the chain to the frame buffer:
    `out = main * mainGain + sub * subGain`, clamped.
 
 ## REST (`/mixer/*`, same auth as the server)
