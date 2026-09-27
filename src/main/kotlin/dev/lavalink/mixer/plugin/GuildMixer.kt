@@ -89,6 +89,17 @@ class GuildMixer(
 
     /** Ticks once per mixer-filter chunk; see [checkFilterHeartbeatLocked]. */
     private val filterRunCount = AtomicLong(0L)
+
+    /**
+     * Decode-side position of the main track: exactly what [MixerFilter] has
+     * already mixed. [track.position] is the *output* position and trails this
+     * by the frame-buffer backlog (frameBufferDuration, 5000ms by default), so
+     * arming an overlap off `track.position` waits until the outgoing track is
+     * already decoded - by then there is no audio left to blend, and the
+     * crossfade degenerates into a cut. [advance] moves it; [syncChainPos]
+     * re-bases it on track start and seeks.
+     */
+    private val chainPos = AtomicLong(0L)
     private var filterRunBaseline = 0L
     private var filterBaselinePos = 0L
     @Volatile private var filterMissing: Boolean = false
@@ -102,6 +113,17 @@ class GuildMixer(
     /** Written by the voice thread every chunk; control plane only (re)starts the fade. */
     @Volatile private var xfadeLeft: Int = 0
     @Volatile private var xfadeTotal: Int = 1
+    /**
+     * Decode-side window the fade runs over. Anchored to the *plan*, not to
+     * the moment poll() happened to notice the chain crossing [plan.startMs]:
+     * the mixer-loop only samples every few milliseconds while the decoder can
+     * burst, so a fade that starts "now" would begin late and still be ramping
+     * when the outgoing track ends - a crossfade that never gets loud enough
+     * to hear. -1 while no planned overlap is running (test seams fall back to
+     * the counted-down form).
+     */
+    @Volatile private var xfadeStartSample: Long = -1L
+    @Volatile private var xfadeEndSample: Long = -1L
     /** Set when the sub decoder reports stuck/exception mid-analysis so scans abort early. */
     @Volatile private var analysisBroken: Boolean = false
 
@@ -147,6 +169,8 @@ class GuildMixer(
                 mainGain.setNow(0f)
                 mainGain.rampTo(1f, msToSamples(snap.fadeInMs))
             }
+            // After the lead-skip seek above: this is where the chain resumes.
+            syncChainPos(track.position)
         }
 
         override fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
@@ -246,18 +270,28 @@ class GuildMixer(
 
     /** Advances ramps by [samples] and returns the gains to mix with. */
     fun advance(samples: Int): Gains {
+        val endOfChunk = chainPos.addAndGet(samples.toLong())
         // Lock-free on purpose: this runs on the voice thread for every ~20ms
         // chunk, and blocking here stalls main-track output until Lavaplayer
         // reports the (healthy) track as stuck. GainRamp fields are volatile;
         // a race with the control plane only shifts a fade by one chunk.
         if (xfadeActive) {
-            val total = xfadeTotal.coerceAtLeast(1)
-            val left = (xfadeLeft - samples).coerceAtLeast(0)
-            xfadeLeft = left
-            val t = (1f - left.toFloat() / total).coerceIn(0f, 1f)
+            val start = xfadeStartSample
+            val end = xfadeEndSample
+            val t = if (start >= 0 && end > start) {
+                val elapsed = (endOfChunk - start).coerceIn(0L, end - start)
+                xfadeLeft = (end - endOfChunk).coerceAtLeast(0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                elapsed.toFloat() / (end - start)
+            } else {
+                val total = xfadeTotal.coerceAtLeast(1)
+                val left = (xfadeLeft - samples).coerceAtLeast(0)
+                xfadeLeft = left
+                1f - left.toFloat() / total
+            }
+            val u = t.coerceIn(0f, 1f)
             // Equal-power curve keeps perceived loudness flat through the overlap.
-            mainGain.setNow(cos(t * PI.toFloat() / 2f))
-            subGain.setNow(sin(t * PI.toFloat() / 2f))
+            mainGain.setNow(cos(u * PI.toFloat() / 2f))
+            subGain.setNow(sin(u * PI.toFloat() / 2f))
         } else {
             mainGain.advance(samples)
             subGain.advance(samples)
@@ -280,6 +314,11 @@ class GuildMixer(
      */
     fun noteFilterRun() {
         filterRunCount.incrementAndGet()
+    }
+
+    /** Re-bases the decode-side position after a track start or a seek. */
+    fun syncChainPos(positionMs: Long) {
+        if (positionMs >= 0) chainPos.set(positionMs * SAMPLE_RATE / 1000)
     }
 
     /**
@@ -321,6 +360,8 @@ class GuildMixer(
     internal fun beginXfadeForTest(totalSamples: Int) {
         xfadeTotal = totalSamples.coerceAtLeast(1)
         xfadeLeft = xfadeTotal
+        xfadeStartSample = -1L
+        xfadeEndSample = -1L
         subOutputSamples.set(0L)
         xfadeActive = true
     }
@@ -392,6 +433,7 @@ class GuildMixer(
         xfadeLogMs = now
         val track = main?.audioPlayer?.playingTrack ?: return
         val pos = safePosition(track)
+        val chain = chainPos.get() * 1000L / SAMPLE_RATE
         val handoff: Long
         val subPos: Long
         val subOutMs: Long
@@ -401,9 +443,9 @@ class GuildMixer(
             subOutMs = subOutputSamples.get()
         }
         log.info(
-            "crossfade progress guild {} at {}ms/handoff {}ms ({}ms left, action={}): " +
+            "crossfade progress guild {} at {}ms (decoded {}ms) /handoff {}ms ({}ms left, action={}): " +
                 "pending={}f/{}ms dropped={}f subOut={}ms subPos={}ms mixerFilterCalls={}",
-            guildId, pos, handoff, (handoff - pos).coerceAtLeast(0), action,
+            guildId, pos, chain, handoff, (handoff - pos).coerceAtLeast(0), action,
             siphon.pendingFrames, siphon.pendingSamples * 1000L / SAMPLE_RATE,
             siphon.droppedFrames,
             subOutMs * 1000L / SAMPLE_RATE,
@@ -429,6 +471,7 @@ class GuildMixer(
             // User seeked backwards: any armed overlap is stale.
             tailCutter.reset()
             resetFilterHeartbeatLocked(pos)
+            syncChainPos(pos)
             if (xfadeActive) return PollAction.AbortXfade("seek during crossfade")
         }
         lastPosition = pos
@@ -444,7 +487,11 @@ class GuildMixer(
                 val plan = if (track.isSeekable && crossfadeEnabled) {
                     TrimTransition.crossfade(contentEnd, crossfadeMs)
                 } else null
-                if (readyNextTrack != null && plan != null && pos >= plan.startMs && !analysisActive) {
+                if (readyNextTrack != null && plan != null &&
+                    chainPos.get() >= plan.startMs * SAMPLE_RATE / 1000 && !analysisActive
+                ) {
+                    // Chain, not track.position: the mix lands on frames as they
+                    // are decoded, which runs a frame buffer ahead of playback.
                     return PollAction.StartOverlap(plan)
                 } else if (silenceSkipEnabled && trail > 0 && pos >= contentEnd) {
                     // End exactly at the last audible sample; do not emit the file's tail silence.
@@ -710,6 +757,17 @@ class GuildMixer(
             siphon.clear()
             xfadeTotal = msToSamples(plan.durationMs).coerceAtLeast(1)
             xfadeLeft = xfadeTotal
+            xfadeStartSample = plan.startMs * SAMPLE_RATE / 1000
+            xfadeEndSample = plan.handoffMs * SAMPLE_RATE / 1000
+            val startSample = xfadeStartSample
+            if (chainPos.get() > startSample) {
+                log.warn(
+                    "crossfade on guild {} armed {}ms after its window opened " +
+                        "(chain at {}ms, window {}ms..{}ms); the fade starts late",
+                    guildId, (chainPos.get() - startSample) * 1000L / SAMPLE_RATE,
+                    chainPos.get() * 1000L / SAMPLE_RATE, plan.startMs, plan.handoffMs,
+                )
+            }
             xfadeLogMs = 0L
         }
         try {
@@ -751,6 +809,8 @@ class GuildMixer(
             val sub = subTrack
             xfadeActive = false
             xfadeHandoffMs = -1L
+            xfadeStartSample = -1L
+            xfadeEndSample = -1L
             if (sub == null) {
                 resetGainsLocked()
                 null
@@ -830,6 +890,8 @@ class GuildMixer(
             )
             xfadeActive = false
             xfadeHandoffMs = -1L
+            xfadeStartSample = -1L
+            xfadeEndSample = -1L
             subTrack = null
             siphon.clear()
             mainGain.rampTo(1f, msToSamples(duckFadeMs))

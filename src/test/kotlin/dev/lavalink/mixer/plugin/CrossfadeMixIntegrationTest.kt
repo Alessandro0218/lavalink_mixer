@@ -244,16 +244,26 @@ class CrossfadeMixIntegrationTest {
 
     // ---- harness ----
 
-    /** Mirrors the production loop: one drain per decoded frame, poll at 100ms of audio. */
+    /**
+     * Mirrors the production loop: one drain per decoded frame, poll at 100ms
+     * of audio, and - crucially - take frames at the rate the voice connection
+     * does. Unpaced, the loop drains the frame buffer faster than the decoder
+     * refills it, so the decoder runs flat out in bursts and crosses the
+     * crossfade window between two polls. That is not what Lavalink does: its
+     * audio thread pulls one frame every 20ms, the buffer stays full, and the
+     * decode side advances at playback rate.
+     */
     private fun pumpUntil(player: AudioPlayer, mixer: GuildMixer, stop: () -> Boolean) {
         val frame = MutableAudioFrame().apply { setBuffer(ByteBuffer.allocate(StandardAudioDataFormats.DISCORD_PCM_S16_LE.maximumChunkSize())) }
         val deadline = System.currentTimeMillis() + 60_000
+        val started = System.nanoTime()
         var frames = 0L
         while (System.currentTimeMillis() < deadline) {
             if (player.provide(frame)) {
                 frames++
                 mixer.drain()
                 if (frames % 5L == 0L) mixer.poll()
+                pace(started, frames)
             } else {
                 mixer.poll()
                 Thread.sleep(1)
@@ -262,9 +272,22 @@ class CrossfadeMixIntegrationTest {
         }
     }
 
+    /** Sleeps until [frames] 20ms frames have elapsed since [started]. */
+    private fun pace(started: Long, frames: Long) {
+        val due = started + frames * 20_000_000L
+        val remaining = due - System.nanoTime()
+        if (remaining <= 0L) return
+        try {
+            Thread.sleep(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     private fun pumpFrames(player: AudioPlayer, mixer: GuildMixer, targetMs: Long) {
         val frame = MutableAudioFrame().apply { setBuffer(ByteBuffer.allocate(StandardAudioDataFormats.DISCORD_PCM_S16_LE.maximumChunkSize())) }
         val deadline = System.currentTimeMillis() + 60_000
+        val started = System.nanoTime()
         var frames = 0L
         val targetFrames = targetMs / 20L
         while (frames < targetFrames && System.currentTimeMillis() < deadline) {
@@ -272,6 +295,7 @@ class CrossfadeMixIntegrationTest {
                 frames++
                 mixer.drain()
                 if (frames % 5L == 0L) mixer.poll()
+                pace(started, frames)
             } else {
                 mixer.poll()
                 Thread.sleep(1)

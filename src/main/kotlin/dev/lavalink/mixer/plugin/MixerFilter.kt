@@ -125,7 +125,9 @@ class MixerFilter(
 
     // Lifecycle events are delivered to every filter in the pipeline by
     // Lavaplayer itself; forwarding them here would double-call downstream.
-    override fun seekPerformed(requestedTime: Long, providedTime: Long) = Unit
+    override fun seekPerformed(requestedTime: Long, providedTime: Long) {
+        if (providedTime >= 0) mixerProvider()?.syncChainPos(providedTime)
+    }
 
     override fun flush() = Unit
 
