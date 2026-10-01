@@ -161,6 +161,9 @@ class GuildMixer(
 
     internal fun lastFilterRunForTest(): Long = lastFilterRunMs.get()
 
+    internal fun newFilterForTest(downstream: com.sedmelluq.discord.lavaplayer.filter.FloatPcmAudioFilter?): MixerFilter =
+        MixerFilter(this, downstream)
+
     // ---- scheduler entry point ----
 
     /** ~50Hz from the mixer loop: keeps the secondary decoder flowing and ends the overlay when due. */
