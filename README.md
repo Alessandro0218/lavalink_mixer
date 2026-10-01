@@ -1,145 +1,96 @@
 # lavalink_mixer
 
-A standalone [Lavalink v4](https://github.com/lavalink-devs/Lavalink) plugin:
-**gapless queue + overlap crossfade + TTS/announcement overlay with ducking +
-leading/trailing silence skipping**. No changes to the Lavalink codebase required.
+A [Lavalink v4](https://github.com/lavalink-devs/Lavalink) plugin that plays a clip
+(TTS, an announcement) **over the music with the music ducked**, on the same player
+and the same voice connection. Fork of
+[mochilabs/lavalink_mixer](https://github.com/mochilabs/lavalink_mixer), cut down to
+that one job (gapless queue, crossfade, silence skipping and fade-in were removed)
+and hardened for it.
 
-Built against `dev.arbjerg.lavalink:plugin-api:4.2.2` + `dev.arbjerg:lavaplayer:2.2.6`
-(Java 17).
-
-- Machine-readable REST spec for agents/tools: [`api/openapi.yaml`](api/openapi.yaml)
-- Bot-side wiring for Tomato6966/lavalink-client: [`examples/lavalink-client/`](examples/lavalink-client/)
-
-## Quickstart
-
-1. Build and install:
-   ```bash
-   ./gradlew jar   # -> build/libs/mixer-1.0.0.jar
-   ```
-   Copy the jar into the server's `plugins/` dir (or declare
-   `dev.lavalink.mixer:mixer:1.0.0` in `application.yml`) and restart Lavalink.
-2. Enable the filter **once per guild** (required for any audible effect):
-   ```json
-   { "op": "filters", "guildId": "123", "pluginFilters": { "mixer": { "guildId": "123" } } }
-   ```
-   The `guildId` inside `pluginFilters.mixer` binds the filter to the guild's
-   mixer state (the extension API passes no player identity to filters).
-   Send `guildId` as a **string** — snowflakes exceed 2^53.
-3. Preload the next track **while the current one is still playing**
-   (ideally right after `trackStart`, so silence analysis finishes in time):
-   ```bash
-   curl -H "Authorization: youshallnotpass" -H "Content-Type: application/json" \
-     -d '{"guildId":"123","encodedTrack":"QAAC..."}' \
-     http://localhost:2333/mixer/queue/next
-   ```
-   The server starts it instantly at content end (`duration -
-   trailingSilence`) — no `play` needed from the client. See the
-   lavalink-client example for the full event flow (`trackStart` = source
-   of truth, `autoSkip: false` required).
-
-Optional `application.yml` defaults:
-
-```yaml
-mixer:
-  crossfadeEnabled: true
-  crossfadeMs: 5000
-  fadeInMs: 300
-  duckLevel: 0.2
-  duckFadeMs: 300
-  maskMs: 80
-  silenceSkipEnabled: false
-  silenceThresholdDb: -60
-  silenceMinSoundMs: 120
-  silenceHeadScanMs: 15000
-  silenceTailScanMs: 15000
-  tailConfirmMs: 1000
-  analysisThreads: 2
-```
-
-Queue/announce accept either `identifier` (re-resolved server-side) or
-`encodedTrack` (exact Lavalink base64, no re-resolution — preferred when the
-client already has it).
+Built against `dev.arbjerg.lavalink:plugin-api:4.2.1` + `dev.arbjerg:lavaplayer:2.2.6` (Java 17).
 
 ## How it works
 
-Discord voice carries a single Opus stream per connection, so a second
-audible source must be mixed **before encoding**. The plugin:
+Discord voice carries a single Opus stream per connection, so a second audible
+source has to be mixed before encoding:
 
-1. Creates a hidden secondary Lavaplayer `AudioPlayer` per guild (from the
-   shared `AudioPlayerManager`, injected as a bean). It never touches voice.
-2. Siphons its decoded float PCM into a bounded queue (`SiphonFilter`); a
-   shared pump thread drains the decoder so it keeps flowing.
-3. Mixes that PCM into the main player's filter chain via the `"mixer"`
-   `AudioFilterExtension` — Lavaplayer feeds the chain head from the decoder,
-   so the mixer runs first on raw PCM (before volume/EQ filters), and mixed
-   chunks are forwarded through the rest of the chain to the frame buffer:
-   `out = main * mainGain + sub * subGain`, clamped.
+1. A hidden secondary Lavaplayer `AudioPlayer` per guild decodes the clip. It never
+   touches voice.
+2. Its decoded PCM is siphoned into a bounded queue and a shared 50Hz loop keeps
+   that decoder flowing.
+3. The `mixer` filter sits in the main player's chain and computes
+   `out = main * mainGain + clip * clipGain`, clamped. The music ramps down to
+   `duckLevel` over `duckFadeMs`, the clip starts after that ramp, and when the clip
+   has been heard to the last sample the music ramps back up.
+
+Consequences worth knowing:
+
+- The mix happens where the main track is *decoded*, so the clip is heard about one
+  frame buffer (`frameBufferDurationMs`) after the call, together with the duck.
+- The chain only runs while the main player decodes. With no music flowing there is
+  nothing to mix into: `announce` answers 409 and the caller should play the clip the
+  normal way (pause path).
+- The mixer filter must be in the chain **before the track starts** (Lavaplayer does
+  not rebuild the chain of a track that is already playing). `announce` answers 409
+  `filter_inactive` when music flows without it.
+
+## Setup
+
+1. `./gradlew build` produces `build/libs/mixer-1.0.0.jar`; drop it in the server's
+   `plugins/` directory (or reference a release asset / JitPack in `application.yml`).
+2. Enable the filter for the guild in the `filters` op, **before** the track plays:
+   ```json
+   { "pluginFilters": { "mixer": { "guildId": "123" } } }
+   ```
+   `guildId` is a **string** (snowflakes exceed 2^53) and binds the filter to the
+   guild's mixer, because the extension API passes no player identity.
+
+Optional `application.yml`:
+
+```yaml
+mixer:
+  duckLevel: 0.2        # music gain while the clip plays, 0..1
+  duckFadeMs: 300       # ramp down before the clip, ramp up after it
+  maxOverlayMs: 120000  # hard cap per overlay
+```
 
 ## REST (`/mixer/*`, same auth as the server)
 
-| Method | Path | Body | Effect |
+Machine-readable spec: [`api/openapi.yaml`](api/openapi.yaml).
+
+| Method | Path | Body / query | Effect |
 |---|---|---|---|
-| POST | `/mixer/queue/next` | `{guildId, identifier?, encodedTrack?}` | Preload next track; played instantly on current track end (gapless) |
-| DELETE | `/mixer/queue/next?guildId=` | – | Drop the queued track |
-| GET | `/mixer/state?guildId=` | – | Mixer state + config |
-| POST | `/mixer/crossfade` | `{guildId, enabled, durationMs?}` | Overlap crossfade (500–30000ms) |
-| POST | `/mixer/fade-in` | `{guildId, durationMs}` | Fade-in on track start (0–10000ms, 0=off) |
-| POST | `/mixer/announce` | `{guildId, identifier?, encodedTrack?, duckLevel?}` | Overlay audio (TTS clip URL etc.) with music ducked; 409 if sub player busy |
-| POST | `/mixer/announce/cancel` | `{guildId}` | Stop overlay, restore music |
-| POST | `/mixer/silence` | `{guildId, enabled, thresholdDb?, minSoundMs?, headScanMs?, tailScanMs?, tailConfirmMs?}` | Leading/trailing silence skipping (see below) |
+| POST | `/mixer/announce` | `{guildId, encodedTrack? \| identifier?, duckLevel?}` | Overlay the clip with the music ducked. Returns `{overlayId, track}` as soon as it starts |
+| POST | `/mixer/announce/cancel` | `{guildId}` | Stop the clip, music comes back. 404 if none is running |
+| GET | `/mixer/state?guildId=` | | `{overlayActive, overlayId, lastOverlay:{id,reason}, filterLive, duckLevel, duckFadeMs}` |
 
-`identifier` is anything the server's source managers can load (track
-identifier, URL for the HTTP source, search prefix). For TTS, point it at
-audio generated by your TTS service.
+`encodedTrack` (exact Lavalink base64, no re-resolution) is preferred over `identifier`.
 
-## Behavior notes / limits
+Errors: `409 overlay_busy`, `409 mixer_unavailable:main_idle`,
+`409 mixer_unavailable:filter_inactive`, `400` bad request or unloadable clip,
+`504` clip did not load in 20s (nothing was started).
 
-- **Efficiency**: the mixer filter allocates no sub buffer unless the
-  secondary gain is active (fade-in/mask are in-place). Silence analysis
-  streams the head decode and stops as soon as the first sound is confirmed
-  (typical tracks decode ~1-2s instead of the full window); short tracks are
-  analyzed in a single pass; analyses run on a bounded pool
-  (`mixer.analysisThreads`, default 2, startup-only).
-- **Silence skipping** (opt-in via `/mixer/silence` or yml): preloaded tracks
-  sit in a pending slot while a background decode scans leading / trailing
-  silence below `thresholdDb` (sustained `minSoundMs` to ignore clicks),
-  then promote to ready. Leading silence is skipped with a seek when the
-  track starts; trailing silence ends the track early (drives gapless
-  advance and the crossfade trigger). A **realtime fallback** watches
-  main-chain energy and cuts after `tailConfirmMs` of sustained silence
-  inside the tail window — no extra decode, and the only signal that works
-  for streams (which demand ≥3s of evidence). If analysis is still running
-  at content end the server advances anyway (no trim) rather than playing
-  silence. Analysis results are cached by track id and visible as
-  `nextTrimMs` in `/mixer/state` (`hasNext` is true from queue time, trim
-  appears when ready). Costs one extra decode per track — that is why it
-  defaults off.
-- **Gapless** removes client round-trip + load latency (preload + immediate
-  server-side `play()` at content end, on `FINISHED`/`LOAD_FAILED`, or on
-  realtime cut). Decoder warmup of a few tens of ms can remain.
-- **Crossfade** needs finite, seekable tracks (streams are skipped for
-  overlap but still advance gaplessly). The overlap covers audible content
-  only and ends exactly at content end; at the handoff the next track is
-  re-started on the main player at the mixed-output offset (non-seekable
-  sources restart from 0). Overlap start waits for analysis to release the
-  sub player, so a slow analysis degrades that transition to a cut. A short
-  masking fade (`maskMs`) hides the seam.
-- **Seeking backwards** during an armed overlap disarms it.
-- **One secondary source at a time** per guild: announce while crossfading
-  (or vice versa) returns 409.
-- TTS audio itself is not synthesized here; the plugin mixes any loadable
-  audio over the music.
+**Knowing the clip is over:** poll `/mixer/state` until `lastOverlay.id >= overlayId`.
+`lastOverlay.reason` is one of `finished`, `cancelled`, `failed`, `stuck`, `timeout`,
+`main_stopped`, `play_failed`.
+
+## Differences from upstream
+
+- Overlay ends only after the clip has been *mixed out*, not when its decoder
+  finishes; upstream cleared the queue at decoder end and cut off the last seconds.
+- Music waits `duckFadeMs` to get out of the way before the clip is audible
+  (upstream played them together for the first ~300ms).
+- A hard cap, a "main stopped" check and a "filter not in chain" check, so the music
+  can never stay ducked and the caller learns when a clip would be inaudible.
+- An announce that times out loading no longer starts the overlay later.
+- Builds against `plugin-api` 4.2.1 (4.2.2 is not resolvable).
 
 ## Developing
 
 ```bash
-./gradlew build   # unit tests (31) + jar; on some filesystems use `sh gradlew`
+./gradlew build   # tests + jar
 ```
-
-Requires Java 17+ and network access to Maven Central + `maven.lavalink.dev`
-for `plugin-api` / `lavaplayer` compile-only deps.
 
 ## License
 
-This project is released into the public domain under the
-[UNLICENSE](UNLICENSE).
+Public domain, [UNLICENSE](UNLICENSE).

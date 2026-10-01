@@ -67,7 +67,7 @@ class MixerFilterExtensionTest {
         filter.process(mixed, 0, 2)
         assertEquals(0.2f, mixed[0][0], 1e-6f)
         assertEquals(-0.2f, mixed[0][1], 1e-6f)
-        assertTrue(mixer.filterRunsForTest() > 0, "heartbeat must tick once the mixer exists")
+        assertTrue(mixer.lastFilterRunForTest() > 0, "heartbeat must tick once the mixer exists")
     }
 
     @Test

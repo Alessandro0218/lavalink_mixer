@@ -1,355 +1,75 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
-  title: mixer-plugin REST API
+  title: lavalink_mixer
   version: 1.0.0
-  description: |
-    Control plane for the Lavalink mixer-plugin (gapless queue, overlap
-    crossfade, TTS/announcement overlay with ducking, silence skipping).
-
-    AGENT WORKFLOW (follow this order per guild):
-    1. Enable audio output once per guild via the Lavalink WebSocket `filters`
-       op: `{ "op": "filters", "guildId": "<id>",
-       "pluginFilters": { "mixer": { "guildId": "<id>" } } }`.
-       Without this step every endpoint below still works, but nothing is audible.
-    2. Optionally tune per-guild behavior: POST /mixer/crossfade,
-       POST /mixer/fade-in, POST /mixer/silence.
-    3. Queue the next track BEFORE the current one ends:
-       POST /mixer/queue/next. This is what makes transitions gapless.
-    4. For talk-over announcements: POST /mixer/announce (music ducks
-       automatically, restores on end).
-    5. Inspect with GET /mixer/state.
-
-    All guildIds are strings (snowflakes exceed 2^53, JSON numbers would lose precision).
-    All durations are milliseconds.
-servers:
-  - url: http://localhost:2333
-    description: Lavalink server (same host/port/auth as the v4 API)
-security:
-  - lavalinkAuth: []
-components:
-  securitySchemes:
-    lavalinkAuth:
-      type: apiKey
-      in: header
-      name: Authorization
-      description: Raw server password (same as the Lavalink v4 API, no Bearer prefix)
-  schemas:
-    Error:
-      type: object
-      required: [message]
-      properties:
-        message: { type: string }
-        status: { type: integer }
-    QueueRequest:
-      type: object
-      required: [guildId]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        identifier:
-          type: string
-          description: |
-            Anything the server's source managers can load: a track identifier,
-            a plain URL (HTTP source), or a search prefix like `ytsearch:lofi`.
-        encodedTrack:
-          type: string
-          description: |
-            Exact Lavalink base64 track (preferred — no re-resolution).
-            At least one of identifier / encodedTrack is required.
-    TrackInfo:
-      type: object
-      properties:
-        identifier: { type: string }
-        title: { type: string }
-        author: { type: string }
-        duration: { type: integer, format: int64, description: Track length in ms }
-        uri: { type: [string, 'null'] }
-        isStream: { type: boolean }
-        isSeekable: { type: boolean }
-        source: { type: string, description: Source manager class, e.g. YoutubeAudioSourceManager }
-    MixerState:
-      type: object
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        hasNext: { type: boolean, description: A preloaded next track is waiting (pending or ready — true from queue time) }
-        overlayActive: { type: boolean }
-        crossfadeActive: { type: boolean, description: An overlap mix is in progress }
-        crossfadeEnabled: { type: boolean }
-        crossfadeMs: { type: integer, format: int64 }
-        fadeInMs: { type: integer, format: int64 }
-        duckLevel: { type: number, format: float }
-        silenceEnabled: { type: boolean }
-        silenceThresholdDb: { type: number, format: float }
-        tailConfirmMs: { type: integer, format: int64, description: Sustained realtime silence before an early cut }
-        nextTrimMs:
-          type: [array, 'null']
-          prefixItems:
-            - { type: integer, description: Leading silence in ms, skipped via seek }
-            - { type: integer, description: Trailing silence in ms, ends the track early }
-          description: Present only when the queued track finished silence analysis (ready). Null while still analyzing (pending) — hasNext is already true then.
-    CrossfadeRequest:
-      type: object
-      required: [guildId, enabled]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        enabled: { type: boolean }
-        durationMs:
-          type: integer
-          format: int64
-          description: Overlap length, clamped to 500-30000. Omit to keep current.
-    FadeInRequest:
-      type: object
-      required: [guildId, durationMs]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        durationMs:
-          type: integer
-          format: int64
-          description: Fade-in on every track start, 0-10000. 0 disables.
-    AnnounceRequest:
-      type: object
-      required: [guildId]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        identifier:
-          type: string
-          description: Audio to overlay (e.g. a TTS service URL). Short clips recommended.
-        encodedTrack:
-          type: string
-          description: Exact Lavalink base64 track (preferred — no re-resolution).
-        duckLevel:
-          type: number
-          format: float
-          description: Music level while overlaying (0-1). Omit for guild default (0.2).
-    AnnounceCancelRequest:
-      type: object
-      required: [guildId]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-    SilenceRequest:
-      type: object
-      required: [guildId, enabled]
-      properties:
-        guildId:
-          type: string
-          description: Guild snowflake as a string (JSON numbers lose precision past 2^53)
-        enabled:
-          type: boolean
-          description: |
-            Opt-in. Preloaded tracks are decoded once more for analysis
-            (extra CPU/bandwidth), so this defaults to false.
-        thresholdDb:
-          type: number
-          format: float
-          description: Below this level counts as silence. Range -90 to -20, default -60.
-        minSoundMs:
-          type: integer
-          format: int64
-          description: Sound must persist this long to count (ignores clicks). Range 20-2000, default 120.
-        headScanMs:
-          type: integer
-          format: int64
-          description: How far into the track to look for the first sound. Range 1000-60000, default 15000.
-        tailScanMs:
-          type: integer
-          format: int64
-          description: Window before the end scanned for trailing silence (seekable tracks only). Range 1000-60000, default 15000.
-        tailConfirmMs:
-          type: integer
-          format: int64
-          description: |
-            Sustained realtime silence before an early cut, no extra decode needed.
-            Range 300-10000, default 1000 (streams demand at least 3000).
+  description: Overlay a clip over the music with the music ducked. Same auth as the Lavalink server.
 paths:
-  /mixer/queue/next:
-    post:
-      operationId: queueNext
-      summary: Preload the next track (the gapless primitive)
-      description: |
-        Loads `identifier` now and stores it in the guild's "next" slot
-        (pending → ready once async silence analysis finishes).
-        At content end (`duration - trailingSilence`) the server starts this
-        track immediately with no client round-trip — detected trailing
-        silence is never played. If analysis is still running then, the
-        server advances anyway without trim rather than stalling.
-        Replaces any previously queued track. For gapless playback, call this
-        while the current track is still playing — ideally right after it starts.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/QueueRequest' }
-      responses:
-        '200':
-          description: Track preloaded and queued
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/TrackInfo' }
-        '202':
-          description: Still loading after 20s; the slot fills in the background
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '400':
-          description: No matches or load failed
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-    delete:
-      operationId: clearNext
-      summary: Drop the queued next track
-      parameters:
-        - name: guildId
-          in: query
-          required: true
-          schema: { type: string, description: Guild snowflake as a string }
-      responses:
-        '204': { description: Queue slot cleared }
-        '404':
-          description: No mixer state or nothing queued
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-  /mixer/state:
-    get:
-      operationId: getState
-      summary: Mixer state and per-guild config
-      parameters:
-        - name: guildId
-          in: query
-          required: true
-          schema: { type: string, description: Guild snowflake as a string }
-      responses:
-        '200':
-          description: Current state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MixerState' }
-        '404':
-          description: Guild never seen (no player yet)
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-  /mixer/crossfade:
-    post:
-      operationId: setCrossfade
-      summary: Configure overlap crossfade
-      description: |
-        When a next track is queued and the current one is finite + seekable,
-        the next track starts on a hidden player `durationMs` before content
-        end (`duration - trailingSilence`, audible content only) and the two
-        mix with an equal-power curve; the handoff lands exactly at content
-        end. Overlap start waits for silence analysis to release the sub
-        player, so a slow analysis degrades that transition to a cut.
-        Requires the mixer filter enabled (step 1 of the workflow).
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CrossfadeRequest' }
-      responses:
-        '200':
-          description: Updated state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MixerState' }
-  /mixer/fade-in:
-    post:
-      operationId: setFadeIn
-      summary: Configure fade-in on track start
-      description: Applies to every track start once the mixer filter is enabled. No queue needed.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/FadeInRequest' }
-      responses:
-        '200':
-          description: Updated state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MixerState' }
   /mixer/announce:
     post:
-      operationId: announce
-      summary: Overlay audio over the music with ducking (TTS use-case)
-      description: |
-        Loads `identifier` on the hidden player and mixes it over the music
-        while ducking the music to `duckLevel`. Unducks automatically when the
-        overlay ends. Only one secondary source per guild: returns 409 while a
-        crossfade overlap or another overlay is active (or analysis is running).
+      summary: Start a ducked overlay
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/AnnounceRequest' }
+            schema:
+              type: object
+              required: [guildId]
+              properties:
+                guildId: {type: string}
+                encodedTrack: {type: string, description: Lavalink base64 track (preferred)}
+                identifier: {type: string, description: Resolved by the server source managers}
+                duckLevel: {type: number, minimum: 0, maximum: 1}
       responses:
-        '200':
-          description: Overlay playing
+        "200":
+          description: Started
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TrackInfo' }
-        '202':
-          description: Still loading after 20s; starts in the background
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '400':
-          description: No matches or load failed
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '409':
-          description: Secondary player busy on this guild
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema:
+                type: object
+                properties:
+                  overlayId: {type: integer, format: int64}
+                  track: {type: object}
+        "400": {description: Bad request or unloadable clip}
+        "409": {description: "overlay_busy | mixer_unavailable:main_idle | mixer_unavailable:filter_inactive"}
+        "504": {description: Clip did not load in time; nothing started}
   /mixer/announce/cancel:
     post:
-      operationId: cancelAnnounce
-      summary: Stop the active overlay and restore music
+      summary: Stop the running overlay
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/AnnounceCancelRequest' }
+            schema:
+              type: object
+              required: [guildId]
+              properties:
+                guildId: {type: string}
       responses:
-        '204': { description: Overlay stopped }
-        '404':
-          description: No active overlay
+        "204": {description: Stopped}
+        "404": {description: No overlay running}
+  /mixer/state:
+    get:
+      summary: Overlay state
+      parameters:
+        - {name: guildId, in: query, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: State
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-  /mixer/silence:
-    post:
-      operationId: setSilenceSkipping
-      summary: Configure leading/trailing silence skipping
-      description: |
-        Leading silence is skipped via seek when a queued track starts (the
-        client-played first track only trims if already cached);
-        trailing silence ends the track early (drives gapless advance and the
-        crossfade trigger). Analysis runs async at queue time (pending →
-        ready); `nextTrimMs` in state shows results once ready. Streams only
-        get leading analysis plus the realtime tail cut.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/SilenceRequest' }
-      responses:
-        '200':
-          description: Updated state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MixerState' }
+              schema:
+                type: object
+                properties:
+                  guildId: {type: string}
+                  overlayActive: {type: boolean}
+                  overlayId: {type: integer, format: int64}
+                  lastOverlay:
+                    type: object
+                    nullable: true
+                    properties:
+                      id: {type: integer, format: int64}
+                      reason: {type: string, enum: [finished, cancelled, failed, stuck, timeout, main_stopped, play_failed]}
+                  filterLive: {type: boolean}
+                  duckLevel: {type: number}
+                  duckFadeMs: {type: integer, format: int64}
+        "404": {description: No mixer for the guild}

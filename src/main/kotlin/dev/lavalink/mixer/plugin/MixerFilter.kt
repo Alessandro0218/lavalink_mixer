@@ -2,7 +2,6 @@ package dev.lavalink.mixer.plugin
 
 import com.sedmelluq.discord.lavaplayer.filter.FloatPcmAudioFilter
 import org.slf4j.LoggerFactory
-import kotlin.math.abs
 
 /**
  * Mix point on the main player's filter chain (registered via the
@@ -28,7 +27,7 @@ import kotlin.math.abs
  * Gains are advanced once per process() call (per chunk, not per sample);
  * with ~20ms chunks that is ~50 gain steps/second, free of zipper noise
  * for ramps >= 80ms. When idle (main=1, sub=0) chunks pass through
- * unmodified.
+ * unmodified and the overlay queue is not touched.
  *
  * Never lets mixer bugs break main output: a mixer exception degrades to
  * passthrough (logged, throttled) while the chunk still goes downstream —
@@ -50,9 +49,7 @@ class MixerFilter(
             downstream?.process(input, offset, length)
             return
         }
-        // Heartbeat for GuildMixer's "is this filter actually in the chain"
-        // probe: a playing track whose position advances while this never
-        // ticks means the filters op never reached the running track.
+        // Heartbeat for GuildMixer's "is this filter actually in the chain" probe.
         mixer.noteFilterRun()
         try {
             mixInto(mixer, input, offset, length)
@@ -69,20 +66,6 @@ class MixerFilter(
     }
 
     private fun mixInto(mixer: GuildMixer, input: Array<FloatArray>, offset: Int, length: Int) {
-        // Realtime tail watch runs on the raw main input, before gains.
-        mixer.realtimeTailAmp()?.let { thresholdAmp ->
-            var peak = 0f
-            for (c in input.indices) {
-                val channel = input[c]
-                val end = offset + length
-                for (i in offset until end) {
-                    val a = abs(channel[i])
-                    if (a > peak) peak = a
-                }
-            }
-            mixer.noteChunk(peak, length, thresholdAmp)
-        }
-
         val gains = mixer.advance(length)
         if (gains.main >= 0.999f && gains.sub <= 0.001f) return // idle passthrough
 
@@ -102,7 +85,6 @@ class MixerFilter(
 
         val sub = Array(input.size) { FloatArray(length) }
         val subSamples = mixer.takeSub(length, input.size, sub)
-        mixer.noteSubOutput(subSamples)
         if (subSamples < length) mixer.noteUnderrun(length - subSamples, length)
 
         for (c in input.indices) {
@@ -125,9 +107,7 @@ class MixerFilter(
 
     // Lifecycle events are delivered to every filter in the pipeline by
     // Lavaplayer itself; forwarding them here would double-call downstream.
-    override fun seekPerformed(requestedTime: Long, providedTime: Long) {
-        if (providedTime >= 0) mixerProvider()?.syncChainPos(providedTime)
-    }
+    override fun seekPerformed(requestedTime: Long, providedTime: Long) = Unit
 
     override fun flush() = Unit
 

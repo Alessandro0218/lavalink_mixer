@@ -6,7 +6,7 @@ import dev.arbjerg.lavalink.api.PluginEventHandler
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 
-/** Tracks guild players so each gets a [GuildMixer] with track listeners attached. */
+/** Tracks guild players so each gets a [GuildMixer]. */
 @Service
 class MixerEvents(private val plugin: MixerPlugin) : PluginEventHandler() {
     override fun onNewPlayer(context: ISocketContext, player: IPlayer) {

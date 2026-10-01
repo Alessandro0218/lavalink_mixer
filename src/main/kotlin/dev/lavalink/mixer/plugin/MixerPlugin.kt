@@ -18,9 +18,11 @@ import java.util.concurrent.TimeUnit
 
 class NoMatchException(identifier: String) : RuntimeException("No matches for identifier: $identifier")
 
+class Announced(val track: AudioTrack, val overlayId: Long)
+
 /**
- * Central registry for per-guild [GuildMixer]s plus the shared ~50Hz pump
- * thread that drains secondary decoders and polls crossfade triggers.
+ * Central registry for per-guild [GuildMixer]s plus the shared ~50Hz loop
+ * that keeps secondary decoders flowing.
  */
 @Service
 class MixerPlugin(
@@ -31,12 +33,6 @@ class MixerPlugin(
     private val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "mixer-loop").apply { isDaemon = true }
     }
-    /** Bounded pool: analyses decode independently per guild, so they parallelize. */
-    private val analysisExecutor = Executors.newFixedThreadPool(config.analysisThreads.coerceIn(1, 8)) { r ->
-        Thread(r, "mixer-analysis").apply { isDaemon = true }
-    }
-    private var tick: Long = 0
-
     init {
         scheduler.scheduleAtFixedRate(::loop, 0, 20, TimeUnit.MILLISECONDS)
     }
@@ -51,33 +47,16 @@ class MixerPlugin(
     }
 
     /**
-     * Loads the next track for gapless pre-queuing. Prefers [encodedTrack]
-     * (exact, no re-resolution) over [identifier] (re-loaded via source
-     * managers). The track is stored on the guild mixer when loading
-     * completes; callers can join the future to report failures synchronously.
+     * Loads the clip and starts it as a ducked overlay. Fails fast, before any
+     * loading, when it could not be heard ([MixerUnavailableException]) or
+     * another overlay is running ([MixerBusyException]).
      */
-    fun preloadNext(guildId: Long, identifier: String?, encodedTrack: String?): CompletableFuture<AudioTrack> {
-        val future = resolveTrack(guildId, identifier, encodedTrack)
-        val mixer = getOrCreate(guildId)
-        mixer.queueNext(future)
-        // Silence analysis runs async off the voice path; results apply if
-        // ready before the track starts, otherwise they are cached by id.
-        future.thenAcceptAsync({ track ->
-            try {
-                mixer.analyzeBlocking(track)
-            } catch (e: Exception) {
-                log.warn("silence analysis failed on guild {}", guildId, e)
-            }
-        }, analysisExecutor)
-        return future
-    }
-
-    /** Loads [identifier] and starts it as a ducked overlay. Fails fast if the sub player is busy. */
-    fun announce(guildId: Long, identifier: String?, encodedTrack: String?, duck: Float?): CompletableFuture<AudioTrack> {
-        val mixer = getOrCreate(guildId)
-        if (mixer.isSubBusy()) throw MixerBusyException("secondary player busy on guild $guildId")
+    fun announce(guildId: Long, identifier: String?, encodedTrack: String?, duck: Float?): CompletableFuture<Announced> {
+        val mixer = find(guildId)
+            ?: throw MixerUnavailableException("main_idle", "no player on guild $guildId")
+        mixer.preflight()
         return resolveTrack(guildId, identifier, encodedTrack).thenApply { track ->
-            mixer.startOverlay(track, duck ?: mixer.duckLevel)
+            Announced(track, mixer.startOverlay(track, duck ?: mixer.duckLevel))
         }
     }
 
@@ -126,27 +105,17 @@ class MixerPlugin(
     }
 
     private fun loop() {
-        tick++
-        val poll = tick % 5L == 0L
         for (mixer in guilds.values) {
             try {
-                mixer.drain()
+                mixer.tick()
             } catch (e: Exception) {
-                log.warn("mixer drain failed", e)
-            }
-            if (poll) {
-                try {
-                    mixer.poll()
-                } catch (e: Exception) {
-                    log.warn("mixer poll failed", e)
-                }
+                log.warn("mixer tick failed", e)
             }
         }
     }
 
     override fun destroy() {
         scheduler.shutdownNow()
-        analysisExecutor.shutdownNow()
         guilds.values.forEach {
             try {
                 it.destroy()

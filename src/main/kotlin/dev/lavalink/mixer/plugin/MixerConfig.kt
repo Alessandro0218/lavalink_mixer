@@ -3,27 +3,16 @@ package dev.lavalink.mixer.plugin
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.stereotype.Component
 
-/** Defaults (overridable per guild via REST). Also bindable from application.yml under `mixer:`. */
+/** Defaults (overridable per request). Also bindable from application.yml under `mixer:`. */
 @Component
 @ConfigurationProperties(prefix = "mixer")
 class MixerConfig {
-    var crossfadeEnabled: Boolean = true
-    var crossfadeMs: Long = 5000
-    var fadeInMs: Long = 300
+    /** Music gain while an overlay plays (0 = silent, 1 = untouched). */
     var duckLevel: Float = 0.2f
+
+    /** Time the music takes to get out of the way, and to come back. The clip starts after the first. */
     var duckFadeMs: Long = 300
-    var maskMs: Long = 80
 
-    // Silence skipping is opt-in: every preloaded track is decoded once more
-    // for analysis, which costs CPU/bandwidth.
-    var silenceSkipEnabled: Boolean = false
-    var silenceThresholdDb: Float = -60f
-    var silenceMinSoundMs: Long = 120
-    var silenceHeadScanMs: Long = 15000
-    var silenceTailScanMs: Long = 15000
-    /** Sustained realtime silence before an early cut (streams demand max(this, 3000)). */
-    var tailConfirmMs: Long = 1000
-
-    /** Parallel silence analyses (per-guild decoders are independent). Read at startup. */
-    var analysisThreads: Int = 2
+    /** Hard cap on one overlay, so a clip that never ends cannot leave the music ducked forever. */
+    var maxOverlayMs: Long = 120_000
 }
