@@ -19,12 +19,12 @@ dependencies {
     // Provided by the Lavalink server at runtime (transitively includes
     // spring-context/spring-web for @Service/@RestController and
     // kotlinx-serialization-json for filter config parsing).
-    compileOnly("dev.arbjerg.lavalink:plugin-api:4.2.2")
+    compileOnly("dev.arbjerg.lavalink:plugin-api:4.2.1")
     // Must match the Lavaplayer version the server runs.
     compileOnly("dev.arbjerg:lavaplayer:2.2.6")
     // compileOnly is not inherited by tests in Gradle; tests also execute code
     // touching these APIs, so they need runtime presence too.
-    testImplementation("dev.arbjerg.lavalink:plugin-api:4.2.2")
+    testImplementation("dev.arbjerg.lavalink:plugin-api:4.2.1")
     testImplementation("dev.arbjerg:lavaplayer:2.2.6")
 
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:2.1.20")
